@@ -2,12 +2,29 @@ package batman
 
 import java.nio.ByteBuffer
 
-private const val FRAME_OGM: Byte = 0x01
-private const val FRAME_DATA: Byte = 0x02
-private const val FRAME_BEACON: Byte = 0x03
+/**
+ * Wire-format type tags. The first byte of every frame identifies its type
+ * so [decode] knows how many bytes to read and how to interpret them.
+ */
+private const val FRAME_OGM: Byte       = 0x01
+private const val FRAME_DATA: Byte      = 0x02
+private const val FRAME_BEACON: Byte    = 0x03
 private const val FRAME_MULTICAST: Byte = 0x04
-private const val FRAME_INVITE: Byte = 0x05
+private const val FRAME_INVITE: Byte    = 0x05
 
+/**
+ * Serialises a [Frame] into a compact binary representation suitable for
+ * transmission over band-limited radio links. All multi-byte integers are
+ * big-endian (Java [ByteBuffer] default).
+ *
+ * Wire layouts (all sizes in bytes):
+ *
+ *   OGM       [0x01 | originatorId(2) | senderId(2) | seqNum(2) | ttl(1)]          = 8 B
+ *   DATA      [0x02 | nextHop(2) | srcId(2) | dstId(2) | ttl(1) | len(2) | payload] = 10+n B
+ *   BEACON    [0x03 | nextHop(2) | srcId(2) | groupId(4)]                           = 9 B
+ *   INVITE    [0x05 | nextHop(2) | srcId(2) | dstId(2) | groupId(4)]               = 11 B
+ *   MULTICAST [0x04 | srcId(2) | groupId(4) | seqNum(2) | ttl(1) | len(2) | payload] = 12+n B
+ */
 fun encode(frame: Frame): ByteArray = when (frame) {
     is Frame.OgmFrame -> {
         val ogm = frame.ogm
@@ -60,6 +77,13 @@ fun encode(frame: Frame): ByteArray = when (frame) {
     }
 }
 
+/**
+ * Deserialises a raw byte array received from a [Link] into a [Frame], or
+ * returns `null` if the bytes are malformed, too short, or carry an unknown type tag.
+ *
+ * All unsigned values stored as signed JVM types (Short, Int) are widened back
+ * to their unsigned Kotlin counterparts (UShort, UInt) via [toUShort]/[toUInt].
+ */
 fun decode(raw: ByteArray): Frame? {
     if (raw.isEmpty()) return null
     val buf = ByteBuffer.wrap(raw)
@@ -112,6 +136,6 @@ fun decode(raw: ByteArray): Frame? {
             val payload = ByteArray(payloadLen).also { buf.get(it) }
             Frame.MulticastFrame(srcId, groupId, seqNum, ttl, payload)
         }
-        else -> null
+        else -> null  // Unknown type tag — silently discard.
     }
 }

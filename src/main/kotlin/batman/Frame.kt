@@ -1,5 +1,22 @@
 package batman
 
+/**
+ * An OGM (Originator Message) is the heartbeat of the BATMAN routing protocol.
+ * Each node periodically broadcasts OGMs so that every other node in the mesh
+ * can discover it and measure path quality.
+ *
+ * @property originatorId The node that originally created this OGM. Never changes
+ *   as the OGM is relayed across hops.
+ * @property senderId The node that most recently rebroadcast this OGM. Updated at
+ *   every relay hop so neighbours know which direct neighbour forwarded it to them.
+ *   Used to populate the neighbour table's nextHop field.
+ * @property seqNum Monotonically increasing sequence number per originator.
+ *   Recipients use this together with [SeenWindowCache] to detect duplicates and
+ *   discard stale relays. Wraps around at UShort.MAX_VALUE (65535).
+ * @property ttl Time-to-live; decremented at each relay hop. Prevents OGMs from
+ *   circulating indefinitely. Also used as a path-quality metric: higher remaining
+ *   TTL on arrival means fewer hops were traversed.
+ */
 data class Ogm(
     val originatorId: NodeId,
     val senderId: NodeId,
@@ -7,22 +24,73 @@ data class Ogm(
     val ttl: UByte
 )
 
+/**
+ * Discriminated union of all frame types carried over the mesh.
+ *
+ * All frames share a single byte type tag in the wire format (see [Codec]).
+ * The [BatmanRouter] dispatches received frames based on their runtime type.
+ */
 sealed class Frame {
+
+    /**
+     * Wraps an [Ogm] for transmission. Broadcast on all links periodically by
+     * each node and relayed (with jitter-based suppression) by intermediate nodes
+     * to build and maintain the distributed routing table.
+     */
     data class OgmFrame(val ogm: Ogm) : Frame()
 
+    /**
+     * Sent periodically by each group member toward the group owner via unicast routing.
+     * As the beacon travels hop-by-hop, every relay node records both the incoming
+     * and outgoing links in the [MulticastTree], progressively building a spanning
+     * tree rooted at the owner. This tree is later used to route [MulticastFrame]s
+     * efficiently without flooding the entire network.
+     *
+     * @property nextHop Link-layer next hop for this unicast frame (changes at each relay).
+     * @property srcId The group member that originated this beacon (stays constant).
+     * @property groupId Identifies which group's tree is being maintained.
+     */
     data class BeaconFrame(
         val nextHop: NodeId,
-        val srcId: NodeId,       // member sending this beacon toward the owner
+        val srcId: NodeId,
         val groupId: GroupId
     ) : Frame()
 
+    /**
+     * Sent by the group owner to invite a specific node into a multicast group.
+     * Routed as a unicast frame through the mesh; each relay node updates [nextHop]
+     * to the next step toward [dstId]. Upon receipt, the destination calls [BatmanRouter.joinGroup]
+     * and begins sending [BeaconFrame]s to build its branch of the multicast tree.
+     *
+     * @property nextHop Link-layer next hop, updated at each relay.
+     * @property srcId The group owner (stays constant).
+     * @property dstId The node being invited (stays constant).
+     * @property groupId The group the invitee is being asked to join.
+     */
     data class InviteFrame(
         val nextHop: NodeId,
-        val srcId: NodeId,       // owner
-        val dstId: NodeId,       // invitee
+        val srcId: NodeId,
+        val dstId: NodeId,
         val groupId: GroupId
     ) : Frame()
 
+    /**
+     * A group multicast message, routed along the spanning tree built by [BeaconFrame]s.
+     * Any group member or the owner can originate a multicast; intermediate nodes
+     * forward it only on links registered in the [MulticastTree] for this group,
+     * excluding the link it arrived on (to prevent echo).
+     *
+     * Duplicate suppression uses [SeenWindowCache] keyed on (srcId, seqNum) so that
+     * a multicast is delivered and relayed exactly once per node even if it arrives
+     * via multiple tree branches simultaneously.
+     *
+     * @property srcId Node that originated this multicast (stays constant across hops).
+     * @property groupId Identifies the destination group.
+     * @property seqNum Per-originator sequence number for deduplication.
+     * @property ttl Decremented at each relay; prevents infinite loops if the tree
+     *   has stale state after a topology change.
+     * @property payload Application-level data.
+     */
     data class MulticastFrame(
         val srcId: NodeId,
         val groupId: GroupId,
@@ -30,6 +98,7 @@ sealed class Frame {
         val ttl: UByte,
         val payload: ByteArray
     ) : Frame() {
+        // ByteArray requires manual equals/hashCode because the default uses reference equality.
         override fun equals(other: Any?): Boolean {
             if (this === other) return true
             if (other !is MulticastFrame) return false
@@ -50,6 +119,18 @@ sealed class Frame {
         }
     }
 
+    /**
+     * A unicast data frame routed hop-by-hop through the mesh.
+     * Each intermediate node looks up [dstId] in its neighbour table and rewrites
+     * [nextHop] to the appropriate next relay before re-enqueueing on the correct link.
+     *
+     * @property nextHop Link-layer addressee for this hop. Nodes on the broadcast
+     *   medium drop frames whose nextHop does not match their own [NodeId].
+     * @property srcId Original sender (stays constant across hops).
+     * @property dstId Final destination (stays constant across hops).
+     * @property ttl Decremented at each hop to bound the worst-case path length.
+     * @property payload Application-level data.
+     */
     data class DataFrame(
         val nextHop: NodeId,
         val srcId: NodeId,
@@ -57,6 +138,7 @@ sealed class Frame {
         val ttl: UByte,
         val payload: ByteArray
     ) : Frame() {
+        // ByteArray requires manual equals/hashCode because the default uses reference equality.
         override fun equals(other: Any?): Boolean {
             if (this === other) return true
             if (other !is DataFrame) return false
