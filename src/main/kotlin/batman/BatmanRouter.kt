@@ -68,12 +68,17 @@ data class MulticastMessage(val srcId: NodeId, val groupId: GroupId, val payload
  * @param txQueue Central transmit queue; injectable for testing.
  * @param staleThreshold How long without a beacon refresh before a multicast tree
  *   branch is considered dead and evicted. Should be at least 3× the beacon interval.
+ * @param neighborPurgeMultiplier How many missed OGM cycles before a neighbour table
+ *   entry is considered unreachable and removed. A node that has been silent for
+ *   [neighborPurgeMultiplier] × [Link.ogmInterval] is presumed gone. Default 3 matches
+ *   batman-adv's own originator timeout heuristic.
  */
 class BatmanRouter(
     val selfId: NodeId,
     val links: List<Link>,
     val txQueue: TxQueue = TxQueue(),
-    val staleThreshold: Duration = 90.seconds
+    val staleThreshold: Duration = 90.seconds,
+    val neighborPurgeMultiplier: Int = 3
 ) {
     // --- Unicast routing state ---
 
@@ -148,6 +153,7 @@ class BatmanRouter(
             scope.launch { txLoop(link) }         // pulls from TxQueue and calls link.broadcast
         }
         scope.launch { staleEvictionLoop() }      // prunes dead multicast tree branches
+        scope.launch { neighborPurgeLoop() }      // evicts unreachable neighbour table entries
     }
 
     // -------------------------------------------------------------------------
@@ -292,6 +298,30 @@ class BatmanRouter(
                 priority   = TxPriority.CONTROL
             ))
             delay(beaconInterval)
+        }
+    }
+
+    /**
+     * Periodically removes unreachable entries from [neighborTable].
+     *
+     * Each entry carries the [Link] it was learned on. An entry is considered stale
+     * when no OGM from that originator has been seen for more than
+     * [neighborPurgeMultiplier] × [Link.ogmInterval] — i.e. the node missed that
+     * many consecutive heartbeat cycles on its best-path link.
+     *
+     * The loop runs at the interval of the fastest link so that entries for nodes
+     * reachable via quick links are evicted promptly. [ConcurrentHashMap.entries.removeIf]
+     * is thread-safe and does not require external locking.
+     */
+    private suspend fun neighborPurgeLoop() {
+        val checkInterval = links.minOf { it.ogmInterval }
+        while (true) {
+            delay(checkInterval)
+            val now = Instant.now()
+            neighborTable.entries.removeIf { (_, entry) ->
+                val expiryMs = entry.link.ogmInterval.inWholeMilliseconds * neighborPurgeMultiplier
+                entry.lastSeen.plusMillis(expiryMs).isBefore(now)
+            }
         }
     }
 
