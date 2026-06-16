@@ -6,37 +6,32 @@ import kotlinx.coroutines.sync.withLock
 import java.time.Instant
 import java.util.TreeSet
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.atomic.AtomicLong
 
 enum class TxPriority { CONTROL, DATA }
+
+private val insertionCounter = AtomicLong(0)
 
 data class TxEntry(
     val frame: ByteArray,
     val targetLink: Link,
     val priority: TxPriority,
-    val enqueuedAt: Instant = Instant.now()
+    val enqueuedAt: Instant = Instant.now(),
+    val insertionOrder: Long = insertionCounter.getAndIncrement()
 ) {
     override fun equals(other: Any?): Boolean {
         if (this === other) return true
         if (other !is TxEntry) return false
-        return priority == other.priority &&
-            enqueuedAt == other.enqueuedAt &&
-            targetLink.id == other.targetLink.id &&
-            frame.contentEquals(other.frame)
+        return insertionOrder == other.insertionOrder
     }
 
-    override fun hashCode(): Int {
-        var result = frame.contentHashCode()
-        result = 31 * result + targetLink.id.hashCode()
-        result = 31 * result + priority.hashCode()
-        result = 31 * result + enqueuedAt.hashCode()
-        return result
-    }
+    override fun hashCode(): Int = insertionOrder.hashCode()
 }
 
 fun defaultComparator(): Comparator<TxEntry> =
     compareBy<TxEntry> { it.priority.ordinal }
         .thenBy { it.enqueuedAt }
-        .thenBy { it.hashCode() }   // stable total order required by TreeSet
+        .thenBy { it.insertionOrder }   // unique counter: no collisions, deterministic
 
 class TxQueue(comparator: Comparator<TxEntry> = defaultComparator()) {
     private val mutex = Mutex()
