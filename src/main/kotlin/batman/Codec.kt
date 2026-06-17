@@ -146,8 +146,8 @@ private fun encodeData(frame: Frame.DataFrame): ByteArray {
 private fun encodeBeacon(frame: Frame.BeaconFrame): ByteArray {
     val nextHop = frame.nextHop.toInt()         and 0xFFF
     val srcId   = frame.srcId.toInt()           and 0xFFF
-    val owner   = frame.groupId.owner().toInt() and 0xFFF
-    val gseq    = frame.groupId.seq().toInt()   and 0xFFFF
+    val owner   = frame.groupId.owner.toInt() and 0xFFF
+    val gseq    = frame.groupId.seq.toInt()   and 0xFFFF
     return byteArrayOf(
         ((TYPE_BEACON shl 4) or (nextHop ushr 8)).toByte(),
         (nextHop and 0xFF).toByte(),
@@ -175,9 +175,9 @@ private fun encodeBeacon(frame: Frame.BeaconFrame): ByteArray {
  */
 private fun encodeMulticast(frame: Frame.MulticastFrame): ByteArray {
     val srcId    = frame.srcId.toInt()           and 0xFFF
-    val owner    = frame.groupId.owner().toInt() and 0xFFF
-    val ttl      = frame.ttl.toInt()             and 0xF
-    val gseq     = frame.groupId.seq().toInt()   and 0xFFFF
+    val owner    = frame.groupId.owner.toInt() and 0xFFF
+    val ttl      = frame.ttl.toInt()           and 0xF
+    val gseq     = frame.groupId.seq.toInt()   and 0xFFFF
     val mcastSeq = frame.seqNum.toInt()          and 0xFFFF
     val payload  = frame.payload
     return ByteArray(9 + payload.size).also { b ->
@@ -211,8 +211,8 @@ private fun encodeInvite(frame: Frame.InviteFrame): ByteArray {
     val nextHop = frame.nextHop.toInt()         and 0xFFF
     val srcId   = frame.srcId.toInt()           and 0xFFF
     val dstId   = frame.dstId.toInt()           and 0xFFF
-    val owner   = frame.groupId.owner().toInt() and 0xFFF
-    val gseq    = frame.groupId.seq().toInt()   and 0xFFFF
+    val owner   = frame.groupId.owner.toInt() and 0xFFF
+    val gseq    = frame.groupId.seq.toInt()   and 0xFFFF
     return byteArrayOf(
         ((TYPE_INVITE shl 4) or (nextHop ushr 8)).toByte(),
         (nextHop and 0xFF).toByte(),
@@ -295,7 +295,7 @@ private fun decodeBeacon(raw: ByteArray, b0: Int): Frame? {
     return Frame.BeaconFrame(
         nextHop = nextHop.toUShort(),
         srcId   = srcId.toUShort(),
-        groupId = groupId(owner.toUShort(), gseq)
+        groupId = GroupId(owner.toUShort(), gseq)
     )
 }
 
@@ -311,7 +311,7 @@ private fun decodeMulticast(raw: ByteArray, b0: Int): Frame? {
     if (raw.size < 9 + payloadLen) return null
     return Frame.MulticastFrame(
         srcId   = srcId.toUShort(),
-        groupId = groupId(owner.toUShort(), gseq),
+        groupId = GroupId(owner.toUShort(), gseq),
         seqNum  = mcastSeq,
         ttl     = ttl,
         payload = raw.copyOfRange(9, 9 + payloadLen)
@@ -331,6 +331,6 @@ private fun decodeInvite(raw: ByteArray, b0: Int): Frame? {
         nextHop = nextHop.toUShort(),
         srcId   = srcId.toUShort(),
         dstId   = dstId.toUShort(),
-        groupId = groupId(owner.toUShort(), gseq)
+        groupId = GroupId(owner.toUShort(), gseq)
     )
 }

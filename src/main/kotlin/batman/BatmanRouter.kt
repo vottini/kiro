@@ -187,7 +187,7 @@ class BatmanRouter(
      * global uniqueness without coordination.
      */
     fun createGroup(): GroupId {
-        val gid = groupId(selfId, groupSeq.getAndIncrement().toUShort())
+        val gid = GroupId(selfId, groupSeq.getAndIncrement().toUShort())
         localGroups.add(gid)
         ownedGroups[gid] = ConcurrentHashMap.newKeySet<NodeId>().also { it.add(selfId) }
         return gid
@@ -289,7 +289,7 @@ class BatmanRouter(
      */
     private suspend fun beaconLoop(gid: GroupId, beaconInterval: Duration) {
         while (gid in localGroups) {
-            val route = neighborTable[gid.owner()] ?: run { delay(beaconInterval); return@run null } ?: continue
+            val route = neighborTable[gid.owner] ?: run { delay(beaconInterval); return@run null } ?: continue
             // Register the outgoing link on this node's side of the tree branch.
             multicastTree.registerLink(gid, route.link)
             txQueue.enqueue(TxEntry(
@@ -501,10 +501,10 @@ class BatmanRouter(
         // Record that this link leads toward a member of the group.
         multicastTree.registerLink(frame.groupId, incomingLink)
 
-        if (frame.groupId.owner() == selfId) return  // we are the root; tree entry is enough
+        if (frame.groupId.owner == selfId) return  // we are the root; tree entry is enough
 
         // Relay the beacon one hop closer to the owner, recording the outgoing link too.
-        val route = neighborTable[frame.groupId.owner()] ?: return
+        val route = neighborTable[frame.groupId.owner] ?: return
         multicastTree.registerLink(frame.groupId, route.link)
         txQueue.enqueue(TxEntry(
             frame      = encode(frame.copy(nextHop = route.nextHop)),
