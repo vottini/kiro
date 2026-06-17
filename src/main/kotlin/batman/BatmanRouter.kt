@@ -13,7 +13,7 @@ import kotlin.time.Duration
 import kotlin.time.Duration.Companion.seconds
 
 /** Maximum TTL assigned to newly created OGMs and data frames. */
-const val MAX_TTL: UByte = 50u
+const val MAX_TTL: UByte = 15u
 
 /**
  * Payload delivered to [BatmanRouter.incomingMulticast] collectors when a
