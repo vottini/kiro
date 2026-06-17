@@ -9,40 +9,81 @@ import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicLong
 
 /**
- * Transmission priority classes.
+ * Describes the kind of frame carried by a [TxEntry].
  *
- * CONTROL frames (OGMs, beacons, invites) are always sent before DATA frames
- * so that routing state remains fresh even when the medium is congested.
- * Within the same priority class, frames are ordered by [TxEntry.enqueuedAt]
- * (oldest first), providing fair FIFO behaviour per class.
+ * Flavors are used by [Rule]s to determine transmission ordering. The
+ * distinction between control and data flavors is the basis of the
+ * [controlFirst] built-in rule, but callers can define arbitrary rules that
+ * treat individual flavors differently (e.g. rank beacons above OGMs).
+ *
+ * [isControl] groups the network-management flavors (OGM, BEACON, INVITE)
+ * that must be delivered promptly to keep routing state fresh, as opposed to
+ * application-data flavors (DATA, MULTICAST) that can tolerate queueing.
  */
-enum class TxPriority { CONTROL, DATA }
+enum class PacketFlavor {
+    OGM, BEACON, INVITE, MULTICAST, DATA;
+
+    val isControl: Boolean get() = this == OGM || this == BEACON || this == INVITE
+}
+
+/**
+ * A [Rule] is a [Comparator] over [TxEntry] that expresses one ordering
+ * concern. Rules are composed in priority order by [TxQueue]: the first rule
+ * that returns a non-zero comparison wins; later rules act as tiebreakers.
+ *
+ * Built-in rules: [controlFirst], [olderFirst], [insertionOrderFirst].
+ */
+typealias Rule = Comparator<TxEntry>
+
+/**
+ * Control flavors (OGM, BEACON, INVITE) are transmitted before data flavors
+ * (DATA, MULTICAST) so that routing state stays fresh under congestion.
+ */
+val controlFirst: Rule = compareBy { if (it.flavor.isControl) 0 else 1 }
+
+/**
+ * Among entries with the same effective priority, older frames are sent first,
+ * providing fair FIFO behaviour within a priority class.
+ */
+val olderFirst: Rule = compareBy { it.enqueuedAt }
+
+/**
+ * Globally unique tie-breaker. Guarantees a strict total order in the
+ * [TreeSet], which is required to prevent silent entry loss when two entries
+ * compare equal on all other fields.
+ */
+val insertionOrderFirst: Rule = compareBy { it.insertionOrder }
+
+/**
+ * The default rule list applied when no custom rules are supplied to [TxQueue].
+ * Applies: control before data → older before newer → insertion order.
+ */
+fun defaultRules(): List<Rule> = listOf(controlFirst, olderFirst, insertionOrderFirst)
 
 /**
  * Global monotonically increasing counter that assigns a unique insertion order
- * to every [TxEntry]. This guarantees a strict total order in the [TreeSet]
- * without relying on hashCode() (which is non-deterministic and can collide,
- * causing TreeSet to silently discard entries it considers equal).
+ * to every [TxEntry], used by [insertionOrderFirst].
  */
 private val insertionCounter = AtomicLong(0)
 
 /**
- * A single item waiting to be transmitted on a specific [Link].
+ * A single item waiting to be transmitted on one of its [eligibleLinks].
  *
  * @property frame Raw bytes to hand to [Link.broadcast].
- * @property targetLink The interface this frame must go out on. Each link's
- *   [BatmanRouter] TX loop independently polls the queue for frames destined
- *   for its own link, so a slow radio never blocks a fast one.
- * @property priority Determines ordering relative to other frames in the queue.
- * @property enqueuedAt Wall-clock time of enqueue, used as secondary sort key so
- *   that among same-priority frames, the oldest is transmitted first.
- * @property insertionOrder Globally unique tie-breaker ensuring a strict total
- *   order even when two frames share the same priority and enqueue timestamp.
+ * @property eligibleLinks The set of [Link]s on which this frame may be sent.
+ *   The first link whose TX coroutine calls [TxQueue.pollFor] will claim and
+ *   transmit it. For frames that must go on a specific link (OGMs, unicast
+ *   hops) use a singleton set; for frames that can go on any of several
+ *   equivalent links leave the set open so the fastest available link wins.
+ * @property flavor Describes the kind of frame, used by [Rule]s to determine
+ *   ordering relative to other entries in the queue.
+ * @property enqueuedAt Wall-clock time of enqueue, used by [olderFirst].
+ * @property insertionOrder Globally unique tie-breaker, used by [insertionOrderFirst].
  */
 data class TxEntry(
     val frame: ByteArray,
-    val targetLink: Link,
-    val priority: TxPriority,
+    val eligibleLinks: Set<Link>,
+    val flavor: PacketFlavor,
     val enqueuedAt: Instant = Instant.now(),
     val insertionOrder: Long = insertionCounter.getAndIncrement()
 ) {
@@ -57,17 +98,6 @@ data class TxEntry(
 }
 
 /**
- * Comparator used by the central [TxQueue].
- * Sort order: CONTROL before DATA → older frames before newer → insertion order as tiebreaker.
- * The insertion-order tiebreaker guarantees a strict total order, which is required
- * by [TreeSet] to avoid silent entry loss on equal-comparing elements.
- */
-fun defaultComparator(): Comparator<TxEntry> =
-    compareBy<TxEntry> { it.priority.ordinal }
-        .thenBy { it.enqueuedAt }
-        .thenBy { it.insertionOrder }
-
-/**
  * Central transmit queue shared by all [Link] TX loops.
  *
  * ## Pull model
@@ -77,52 +107,82 @@ fun defaultComparator(): Comparator<TxEntry> =
  * available (i.e. the previous [Link.broadcast] call has returned). This means:
  *   - A slow radio never blocks a fast one.
  *   - Backpressure is handled naturally: the link drains at its own pace.
- *   - Priority ordering is enforced at dequeue time across all pending frames.
+ *   - Ordering is enforced at dequeue time across all pending frames.
+ *
+ * ## Rule-based ordering
+ *
+ * The queue is ordered by composing a [List] of [Rule]s into a single
+ * [Comparator]. Rules are applied in list order; the first rule that returns
+ * a non-zero result determines the relative position of two entries. The
+ * default rule list ([defaultRules]) places control frames before data frames,
+ * then breaks ties by enqueue time and finally by insertion order.
+ *
+ * Custom rule lists can reorder, add, or remove rules. For example, to always
+ * drain OGMs before beacons before all other control frames:
+ * ```
+ * val q = TxQueue(listOf(
+ *     compareBy { when (it.flavor) { OGM -> 0; BEACON -> 1; else -> 2 } },
+ *     olderFirst,
+ *     insertionOrderFirst
+ * ))
+ * ```
+ *
+ * ## Eligible-link work stealing
+ *
+ * Each [TxEntry] carries a set of [TxEntry.eligibleLinks] rather than a
+ * single target. The first link whose TX coroutine becomes free and calls
+ * [pollFor] claims the entry exclusively, enabling natural load-balancing
+ * across redundant paths without any explicit scheduler.
  *
  * ## Suspension
  *
- * [pollFor] suspends the calling coroutine until a frame destined for its link
- * is available. When [enqueue] finds a waiting coroutine for the target link it
- * completes the deferred directly, bypassing the sorted set entirely.
+ * [pollFor] suspends the calling coroutine until an eligible frame is
+ * available. When [enqueue] finds a waiting coroutine for any of the entry's
+ * eligible links it completes the deferred directly, bypassing the sorted set.
  *
  * ## Thread safety
  *
- * All mutations to [entries] are guarded by [mutex]. The [waiters] map uses
- * a [ConcurrentHashMap] for safe concurrent access to the per-link waiter queues.
+ * All mutations to [entries] are guarded by [mutex].
  */
-class TxQueue(comparator: Comparator<TxEntry> = defaultComparator()) {
+class TxQueue(rules: List<Rule> = defaultRules()) {
     private val mutex = Mutex()
 
-    /** Sorted set of pending entries, ordered by [defaultComparator]. */
+    /** Composite comparator built by chaining [rules] in order. */
+    private val comparator: Rule = rules.reduce { acc, rule -> acc.then(rule) }
+
+    /** Sorted set of pending entries, ordered by the composite [comparator]. */
     private val entries = TreeSet<TxEntry>(comparator)
 
     /**
      * Per-link queues of suspended [pollFor] callers waiting for a frame.
-     * When a frame is enqueued for a link that has a waiting coroutine, the
-     * deferred is resolved immediately without touching [entries].
+     * When a frame is enqueued whose eligible set includes a link that has a
+     * waiting coroutine, the deferred is resolved immediately without touching
+     * [entries].
      */
     private val waiters = ConcurrentHashMap<String, ArrayDeque<CompletableDeferred<TxEntry>>>()
 
     /**
      * Adds [entry] to the queue, or delivers it directly to a waiting [pollFor]
-     * caller if one exists for the target link.
+     * caller if one exists for any of the entry's [TxEntry.eligibleLinks].
      *
-     * Called from OGM loops, TX relay logic, and data forwarding paths.
+     * Eligible links are checked in iteration order; the first link with a
+     * waiting coroutine claims the entry. If no waiter is found the entry is
+     * parked in the sorted set until a link calls [pollFor].
      */
     suspend fun enqueue(entry: TxEntry) = mutex.withLock {
-        val pending = waiters[entry.targetLink.id]
-        if (!pending.isNullOrEmpty()) {
-            // A TX coroutine is already suspended waiting for this link — hand off directly.
-            pending.removeFirst().complete(entry)
+        val waiter = entry.eligibleLinks
+            .firstNotNullOfOrNull { link -> waiters[link.id]?.takeIf { it.isNotEmpty() } }
+            ?.removeFirst()
+        if (waiter != null) {
+            waiter.complete(entry)
         } else {
-            // No waiter; park the entry in the sorted set until the link is ready.
             entries.add(entry)
         }
     }
 
     /**
-     * Returns the highest-priority pending [TxEntry] destined for [link],
-     * suspending the caller until one is available.
+     * Returns the highest-priority pending [TxEntry] for which [link] is
+     * eligible, suspending the caller until one is available.
      *
      * The deferred is registered under the mutex to eliminate the TOCTOU race
      * between "nothing available" and "enqueue arrives": if a frame is enqueued
@@ -132,13 +192,11 @@ class TxQueue(comparator: Comparator<TxEntry> = defaultComparator()) {
     suspend fun pollFor(link: Link): TxEntry {
         val deferred = CompletableDeferred<TxEntry>()
         mutex.withLock {
-            val entry = entries.firstOrNull { it.targetLink === link }
+            val entry = entries.firstOrNull { link in it.eligibleLinks }
             if (entry != null) {
-                // Frame already waiting — complete immediately without suspending.
                 entries.remove(entry)
                 deferred.complete(entry)
             } else {
-                // Nothing available — register as a waiter so enqueue can wake us.
                 waiters.getOrPut(link.id) { ArrayDeque() }.addLast(deferred)
             }
         }

@@ -173,7 +173,7 @@ class BatmanRouter(
             ttl     = MAX_TTL,
             payload = payload
         )
-        txQueue.enqueue(TxEntry(encode(frame), route.link, TxPriority.DATA))
+        txQueue.enqueue(TxEntry(encode(frame), setOf(route.link), PacketFlavor.DATA))
     }
 
     // -------------------------------------------------------------------------
@@ -203,9 +203,9 @@ class BatmanRouter(
         val route = neighborTable[memberId] ?: return
         ownedGroups[gid]?.add(memberId)
         txQueue.enqueue(TxEntry(
-            frame      = encode(Frame.InviteFrame(route.nextHop, selfId, memberId, gid)),
-            targetLink = route.link,
-            priority   = TxPriority.CONTROL
+            frame         = encode(Frame.InviteFrame(route.nextHop, selfId, memberId, gid)),
+            eligibleLinks = setOf(route.link),
+            flavor        = PacketFlavor.INVITE
         ))
     }
 
@@ -243,7 +243,7 @@ class BatmanRouter(
         seenMulticasts.markIfNew(selfId, seq)   // pre-mark to suppress our own echo
         val frame = Frame.MulticastFrame(selfId, gid, seq, MAX_TTL, payload)
         multicastTree.allLinksFor(gid).forEach { link ->
-            txQueue.enqueue(TxEntry(encode(frame), link, TxPriority.DATA))
+            txQueue.enqueue(TxEntry(encode(frame), setOf(link), PacketFlavor.MULTICAST))
         }
     }
 
@@ -260,7 +260,7 @@ class BatmanRouter(
     private suspend fun ogmLoop(link: Link) {
         while (true) {
             val seq = ogmSeq.getAndIncrement().toUShort()
-            txQueue.enqueue(TxEntry(encode(Frame.OgmFrame(Ogm(selfId, selfId, seq, MAX_TTL))), link, TxPriority.CONTROL))
+            txQueue.enqueue(TxEntry(encode(Frame.OgmFrame(Ogm(selfId, selfId, seq, MAX_TTL))), setOf(link), PacketFlavor.OGM))
             delay(link.ogmInterval)
         }
     }
@@ -293,9 +293,9 @@ class BatmanRouter(
             // Register the outgoing link on this node's side of the tree branch.
             multicastTree.registerLink(gid, route.link)
             txQueue.enqueue(TxEntry(
-                frame      = encode(Frame.BeaconFrame(route.nextHop, selfId, gid)),
-                targetLink = route.link,
-                priority   = TxPriority.CONTROL
+                frame         = encode(Frame.BeaconFrame(route.nextHop, selfId, gid)),
+                eligibleLinks = setOf(route.link),
+                flavor        = PacketFlavor.BEACON
             ))
             delay(beaconInterval)
         }
@@ -424,7 +424,7 @@ class BatmanRouter(
                 // Skipping the incoming link avoids pointless retransmission back
                 // toward the sender and halves bandwidth use in sparse chains.
                 links.filter { it.id != link.id }.forEach { outLink ->
-                    txQueue.enqueue(TxEntry(encode(Frame.OgmFrame(relay)), outLink, TxPriority.CONTROL))
+                    txQueue.enqueue(TxEntry(encode(Frame.OgmFrame(relay)), setOf(outLink), PacketFlavor.OGM))
                 }
             }
         }
@@ -476,9 +476,9 @@ class BatmanRouter(
         if (frame.ttl == 0u.toUByte()) return
         val route = neighborTable[frame.dstId] ?: return
         txQueue.enqueue(TxEntry(
-            frame      = encode(frame.copy(nextHop = route.nextHop, ttl = (frame.ttl - 1u).toUByte())),
-            targetLink = route.link,
-            priority   = TxPriority.DATA
+            frame         = encode(frame.copy(nextHop = route.nextHop, ttl = (frame.ttl - 1u).toUByte())),
+            eligibleLinks = setOf(route.link),
+            flavor        = PacketFlavor.DATA
         ))
     }
 
@@ -507,9 +507,9 @@ class BatmanRouter(
         val route = neighborTable[frame.groupId.owner] ?: return
         multicastTree.registerLink(frame.groupId, route.link)
         txQueue.enqueue(TxEntry(
-            frame      = encode(frame.copy(nextHop = route.nextHop)),
-            targetLink = route.link,
-            priority   = TxPriority.CONTROL
+            frame         = encode(frame.copy(nextHop = route.nextHop)),
+            eligibleLinks = setOf(route.link),
+            flavor        = PacketFlavor.BEACON
         ))
     }
 
@@ -528,9 +528,9 @@ class BatmanRouter(
         }
         val route = neighborTable[frame.dstId] ?: return
         txQueue.enqueue(TxEntry(
-            frame      = encode(frame.copy(nextHop = route.nextHop)),
-            targetLink = route.link,
-            priority   = TxPriority.CONTROL
+            frame         = encode(frame.copy(nextHop = route.nextHop)),
+            eligibleLinks = setOf(route.link),
+            flavor        = PacketFlavor.INVITE
         ))
     }
 
@@ -553,7 +553,7 @@ class BatmanRouter(
 
         val relayed = frame.copy(ttl = (frame.ttl - 1u).toUByte())
         multicastTree.linksFor(frame.groupId, except = incomingLink).forEach { outLink ->
-            txQueue.enqueue(TxEntry(encode(relayed), outLink, TxPriority.DATA))
+            txQueue.enqueue(TxEntry(encode(relayed), setOf(outLink), PacketFlavor.MULTICAST))
         }
     }
 }
