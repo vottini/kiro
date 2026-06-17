@@ -1,0 +1,295 @@
+<!DOCTYPE html>
+<html lang="pt-BR">
+<head>
+<meta charset="UTF-8">
+<title>BATMAN Mesh Router — Arquitetura</title>
+<script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+<style>
+  body { font-family: Georgia, serif; max-width: 960px; margin: 40px auto; padding: 0 24px; color: #1a1a1a; }
+  h1   { font-size: 2em; border-bottom: 2px solid #333; padding-bottom: 8px; }
+  h2   { font-size: 1.4em; margin-top: 2.4em; border-left: 4px solid #555; padding-left: 10px; }
+  h3   { font-size: 1.1em; margin-top: 1.6em; color: #333; }
+  p, li { line-height: 1.7; }
+  code { background: #f4f4f4; padding: 2px 5px; border-radius: 3px; font-size: 0.9em; }
+  pre  { background: #f4f4f4; padding: 16px; border-radius: 6px; overflow-x: auto; font-size: 0.85em; line-height: 1.5; }
+  .mermaid { margin: 24px 0; }
+  table { border-collapse: collapse; width: 100%; margin: 16px 0; font-size: 0.9em; }
+  th, td { border: 1px solid #ccc; padding: 8px 12px; text-align: left; }
+  th { background: #f0f0f0; }
+  .note { background: #fffbe6; border-left: 4px solid #f0c040; padding: 10px 14px; margin: 16px 0; border-radius: 0 4px 4px 0; font-size: 0.92em; }
+  @media print { body { max-width: 100%; margin: 0; padding: 16px; } }
+</style>
+</head>
+<body>
+<script>mermaid.initialize({ startOnLoad: true, theme: 'neutral', fontFamily: 'Georgia, serif' });</script>
+
+<h1>BATMAN Mesh Router — Visão Geral da Arquitetura</h1>
+<p>
+  Uma implementação em Kotlin/JVM do algoritmo de roteamento <strong>BATMAN</strong>
+  (Better Approach To Mobile Ad-hoc Networking) voltada a redes mesh de rádio heterogêneas e com
+  largura de banda limitada. Cada nó descobre rotas inundando OGMs leves pela rede; nenhum nó
+  computa caminhos completos — apenas a decisão do próximo salto (<em>next-hop</em>) é tomada localmente.
+</p>
+
+<!-- ═══════════════════════════════════════════════════════════ -->
+<h2>1. Mapa de Componentes</h2>
+<p>Os principais componentes em tempo de execução e seus relacionamentos:</p>
+
+<div class="mermaid">
+graph TD
+    subgraph BatmanRouter["BatmanRouter (um por nó)"]
+        RX["receiveLoop\npor Link"]
+        OGM["ogmLoop\npor Link"]
+        TX["txLoop\npor Link"]
+        PURGE["neighborPurgeLoop"]
+        EVICT["staleEvictionLoop"]
+    end
+
+    subgraph State["Estado"]
+        NT["neighborTable\nConcurrentHashMap&lt;NodeId, NeighborEntry&gt;"]
+        MT["MulticastTree\nConcurrentHashMap&lt;GroupId, links&gt;"]
+        SC["SeenWindowCache\nBitSet sliding window por originador"]
+        GRP["localGroups / ownedGroups"]
+    end
+
+    subgraph IO
+        LINK["interface Link\n(serial, UDP, …)"]
+        TXQ["TxQueue\nTreeSet + CompletableDeferred waiters"]
+        CODEC["Codec\nencode() / decode()"]
+    end
+
+    RX -->|"decode(raw)"| CODEC
+    CODEC -->|Frame| RX
+    RX -->|"markIfNew()"| SC
+    RX -->|"atualiza"| NT
+    RX -->|"registerLink()"| MT
+    RX -->|"enqueue(TxEntry)"| TXQ
+
+    OGM -->|"encode(OgmFrame)"| CODEC
+    OGM -->|"enqueue(TxEntry)"| TXQ
+
+    TX -->|"pollFor(link)"| TXQ
+    TX -->|"broadcast(bytes)"| LINK
+    LINK -->|"frames: Flow"| RX
+
+    PURGE -->|"remove obsoletos"| NT
+    EVICT -->|"evictStale()"| MT
+</div>
+
+<!-- ═══════════════════════════════════════════════════════════ -->
+<h2>2. Inundação de OGM e Descoberta de Rotas</h2>
+<p>
+  Cada nó periodicamente transmite um <strong>Originator Message (OGM)</strong> em cada um de seus links.
+  Nós de retransmissão reenviam OGMs que ainda não viram, decrementando o TTL e atualizando
+  <code>senderId</code> para o seu próprio ID. A métrica de roteamento é implícita: a qualidade de uma
+  rota é o <em>maior TTL restante</em> quando o OGM chega, equivalente a <em>15 − número de saltos</em>.
+</p>
+
+<div class="mermaid">
+sequenceDiagram
+    participant A as Nó A (originador)
+    participant B as Nó B (relay)
+    participant C as Nó C (relay)
+    participant D as Nó D
+
+    Note over A: ogmLoop dispara a cada ogmInterval
+    A->>B: OGM {origId=A, senderId=A, seq=N, ttl=15}
+    A->>C: OGM {origId=A, senderId=A, seq=N, ttl=15}
+
+    Note over B: seenCache miss → retransmite com jitter
+    B->>C: OGM {origId=A, senderId=B, seq=N, ttl=14}
+    B->>D: OGM {origId=A, senderId=B, seq=N, ttl=14}
+
+    Note over C: recebeu 2 cópias → P(relay)=1/2
+    C-->>D: OGM {origId=A, senderId=C, seq=N, ttl=13}
+
+    Note over D: neighborTable[A] = {nextHop=B, ttl=14, link=…}
+</div>
+
+<h3>Supressão de retransmissão</h3>
+<ul>
+  <li><strong>Deduplicação:</strong> <code>SeenWindowCache</code> usa um <code>BitSet</code> deslizante de 64 bits
+    por originador, tratando o wraparound de UShort (0–65535) via diferença modular com sinal.</li>
+  <li><strong>Jitter:</strong> a retransmissão é atrasada por <code>ogmInterval / (8 + rand(0,3))</code> para que
+    cópias vindas de caminhos diferentes cheguem dentro da janela e sejam contabilizadas.</li>
+  <li><strong>Supressão probabilística:</strong> após a janela de jitter, se <em>N</em> cópias foram recebidas,
+    a probabilidade de retransmitir é <code>1/N</code> — suprime naturalmente retransmissões redundantes
+    em redes densas.</li>
+  <li><strong>Sem relay de volta:</strong> OGMs nunca são reenviados pelo link pelo qual chegaram.</li>
+</ul>
+
+<!-- ═══════════════════════════════════════════════════════════ -->
+<h2>3. Grupos Multicast e Árvore de Espalhamento</h2>
+<p>
+  O multicast é roteado em árvore, não inundado. A árvore é construída implicitamente por beacons
+  dos membros viajando em direção ao dono do grupo — cada nó de retransmissão no caminho registra
+  a si mesmo como um ramo da árvore.
+</p>
+
+<div class="mermaid">
+sequenceDiagram
+    participant Owner as Owner (dono)
+    participant Relay as Relay (retransmissor)
+    participant Member as Member (membro)
+
+    Note over Owner: createGroup() → GroupId(owner=Owner, seq=0)
+    Owner->>Relay: InviteFrame {dst=Member}
+    Relay->>Member: InviteFrame {dst=Member}
+    Member->>Member: joinGroup() → inicia beaconLoop
+
+    loop a cada beaconInterval
+        Member->>Relay: BeaconFrame {groupId, nextHop=Relay}
+        Note over Relay: registerLink(groupId, incomingLink)
+        Note over Relay: registerLink(groupId, outgoingLink)
+        Relay->>Owner: BeaconFrame {groupId, nextHop=Owner}
+        Note over Owner: registerLink(groupId, incomingLink)
+    end
+
+    Note over Owner: MulticastTree construída ✓
+
+    Owner->>Relay: MulticastFrame {groupId, payload}
+    Note over Relay: linksFor(groupId, except=incomingLink)
+    Relay->>Member: MulticastFrame {groupId, payload}
+</div>
+
+<h3>Remoção de ramos obsoletos</h3>
+<p>
+  Cada <code>LinkEntry</code> na <code>MulticastTree</code> registra <code>lastSeen</code>.
+  Um loop em segundo plano chama <code>evictStale(threshold)</code> a cada <code>threshold/3</code>;
+  ramos cujo membro parou de enviar beacons são podados após no máximo <code>threshold</code> de tempo.
+</p>
+
+<!-- ═══════════════════════════════════════════════════════════ -->
+<h2>4. Fila de Transmissão</h2>
+<p>
+  Uma fila central no modelo <strong>pull</strong> desacopla produtores (lógica de roteamento) de
+  consumidores (corrotinas TX por link). Cada link drena no seu próprio ritmo; um rádio lento
+  nunca bloqueia um rádio rápido.
+</p>
+
+<div class="mermaid">
+graph LR
+    subgraph Produtores
+        P1["ogmLoop"]
+        P2["handleOgm relay"]
+        P3["send()"]
+        P4["sendMulticast()"]
+        P5["handleBeacon relay"]
+    end
+
+    subgraph TxQueue
+        TS["TreeSet&lt;TxEntry&gt;\nordenado por Rules"]
+        WM["waiters\nMap&lt;linkId, Deferred&gt;"]
+    end
+
+    subgraph Corrotinas TX
+        T1["txLoop(linkA)\npollFor(linkA)"]
+        T2["txLoop(linkB)\npollFor(linkB)"]
+    end
+
+    P1 & P2 & P3 & P4 & P5 -->|"enqueue(TxEntry)"| TS
+    TS -->|"primeiro elegível"| T1
+    TS -->|"primeiro elegível"| T2
+    WM -.->|"entrega direta\nse waiter aguardando"| T1
+    WM -.->|"entrega direta\nse waiter aguardando"| T2
+</div>
+
+<h3>Ordenação por regras</h3>
+<p>
+  <code>TxQueue</code> recebe uma <code>List&lt;Rule&gt;</code> (cada uma um <code>Comparator&lt;TxEntry&gt;</code>)
+  composta em ordem. As regras padrão são:
+</p>
+<ol>
+  <li><strong>controlFirst</strong> — OGM, BEACON, INVITE antes de MULTICAST, DATA</li>
+  <li><strong>olderFirst</strong> — FIFO dentro da mesma classe</li>
+  <li><strong>insertionOrderFirst</strong> — desempate de ordem total estrita para corretude do <code>TreeSet</code></li>
+</ol>
+
+<h3>Work stealing por links elegíveis</h3>
+<p>
+  Cada <code>TxEntry</code> carrega um <code>Set&lt;Link&gt;</code> de rádios elegíveis em vez de um
+  único destino. A primeira corrotina TX a chamar <code>pollFor</code> para qualquer link elegível
+  reivindica o frame exclusivamente. Isso viabiliza balanceamento de carga natural entre caminhos
+  redundantes sem custo adicional.
+</p>
+
+<!-- ═══════════════════════════════════════════════════════════ -->
+<h2>5. Formato de Quadro (Wire Format)</h2>
+<p>
+  Todos os frames usam um layout compacto com empacotamento de bits. NodeIds têm 12 bits
+  (máximo de 4095 nós), TTL tem 4 bits (máximo de 15 saltos) e o tipo de frame ocupa o nibble
+  superior do byte 0. Autenticação versus criptografia é uma propriedade do link — nenhum flag
+  por frame é necessário.
+</p>
+
+<table>
+  <tr><th>Frame</th><th>Tamanho</th><th>Economia vs. layout naïve de 16 bits</th><th>Nibble superior do byte 0 (tipo)</th></tr>
+  <tr><td>OGM</td><td>6 B</td><td>−2 B</td><td>0x0</td></tr>
+  <tr><td>DataFrame</td><td>7 + n B</td><td>−3 B</td><td>0x1</td></tr>
+  <tr><td>BeaconFrame</td><td>7 B</td><td>−2 B</td><td>0x2</td></tr>
+  <tr><td>MulticastFrame</td><td>9 + n B</td><td>−3 B</td><td>0x3</td></tr>
+  <tr><td>InviteFrame</td><td>9 B</td><td>−2 B</td><td>0x4</td></tr>
+</table>
+
+<p>Layout do byte 0, compartilhado por todos os tipos de frame:</p>
+<pre>
+  bits 7–4 : type (4 bits, valores 0–4 usados, 5–15 reservados)
+  bits 3–0 : firstId[11:8]  (nibble alto do identificador de 12 bits inicial)
+</pre>
+
+<p>Exemplo de layout do OGM (6 bytes):</p>
+<pre>
+  B0: [type:4 | origId[11:8]:4]
+  B1: origId[7:0]
+  B2: [sendId[11:8]:4 | ttl[3:0]:4]
+  B3: sendId[7:0]
+  B4: seqNum[15:8]
+  B5: seqNum[7:0]
+</pre>
+
+<p>
+  O <code>GroupId</code> é transmitido como seus campos constituintes (owner de 12 bits + seq de 16 bits)
+  em vez de um <code>UInt</code> bruto de 32 bits, economizando 4 bits. Em memória ele é uma data class:
+  <code>data class GroupId(val owner: NodeId, val seq: UShort)</code>.
+</p>
+
+<!-- ═══════════════════════════════════════════════════════════ -->
+<h2>6. Principais Decisões de Projeto</h2>
+
+<table>
+  <tr><th>Decisão</th><th>Justificativa</th></tr>
+  <tr>
+    <td>Intervalo do OGM como métrica de roteamento</td>
+    <td>Links mais lentos emitem OGMs com menos frequência → acumulam TTL menor no destino → são preferidos apenas quando não existe caminho mais rápido. Sem overhead adicional.</td>
+  </tr>
+  <tr>
+    <td>TxQueue no modelo pull</td>
+    <td>A corrotina TX de cada link suspende quando ociosa e acorda sob demanda via <code>CompletableDeferred</code>. Rádios lentos nunca bloqueiam rádios rápidos; sem polling ou busy-waiting.</td>
+  </tr>
+  <tr>
+    <td>Probabilidade de relay 1/N</td>
+    <td>Em sub-redes densas onde N nós ouvem o mesmo OGM, em média apenas 1/N retransmite — equivalente a um único relay em expectativa, reduzindo drasticamente tempestades de OGM.</td>
+  </tr>
+  <tr>
+    <td>Árvore multicast via beacon</td>
+    <td>Evita inundação no multicast fazendo com que os próprios membros construam a árvore com beacons periódicos. O dono só precisa encaminhar pelos ramos registrados.</td>
+  </tr>
+  <tr>
+    <td>Janela deslizante com BitSet para deduplicação</td>
+    <td>O(1) por consulta, memória limitada (64 bits por originador), trata corretamente o wraparound de UShort via diferença modular com sinal.</td>
+  </tr>
+  <tr>
+    <td>Limite de 12 bits para NodeId</td>
+    <td>Redes mesh com rádios de banda limitada raramente ultrapassam algumas centenas de nós. 12 bits (4095 nós) é suficiente e economiza 1 byte por campo NodeId no wire.</td>
+  </tr>
+</table>
+
+<div class="note">
+  <strong>Expiração da tabela de vizinhos:</strong> cada entrada expira após
+  <code>ogmInterval × neighborPurgeMultiplier</code> (padrão 3×) sem um OGM de atualização.
+  Isso espelha o PURGE_TIMEOUT do batman-adv e garante que rotas obsoletas sejam removidas
+  automaticamente após um nó ficar silencioso.
+</div>
+
+</body>
+</html>

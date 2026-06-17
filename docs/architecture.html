@@ -1,0 +1,289 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>BATMAN Mesh Router — Architecture</title>
+<script src="https://cdn.jsdelivr.net/npm/mermaid@10/dist/mermaid.min.js"></script>
+<style>
+  body { font-family: Georgia, serif; max-width: 960px; margin: 40px auto; padding: 0 24px; color: #1a1a1a; }
+  h1   { font-size: 2em; border-bottom: 2px solid #333; padding-bottom: 8px; }
+  h2   { font-size: 1.4em; margin-top: 2.4em; border-left: 4px solid #555; padding-left: 10px; }
+  h3   { font-size: 1.1em; margin-top: 1.6em; color: #333; }
+  p, li { line-height: 1.7; }
+  code { background: #f4f4f4; padding: 2px 5px; border-radius: 3px; font-size: 0.9em; }
+  pre  { background: #f4f4f4; padding: 16px; border-radius: 6px; overflow-x: auto; font-size: 0.85em; line-height: 1.5; }
+  .mermaid { margin: 24px 0; }
+  table { border-collapse: collapse; width: 100%; margin: 16px 0; font-size: 0.9em; }
+  th, td { border: 1px solid #ccc; padding: 8px 12px; text-align: left; }
+  th { background: #f0f0f0; }
+  .note { background: #fffbe6; border-left: 4px solid #f0c040; padding: 10px 14px; margin: 16px 0; border-radius: 0 4px 4px 0; font-size: 0.92em; }
+  @media print { body { max-width: 100%; margin: 0; padding: 16px; } }
+</style>
+</head>
+<body>
+<script>mermaid.initialize({ startOnLoad: true, theme: 'neutral', fontFamily: 'Georgia, serif' });</script>
+
+<h1>BATMAN Mesh Router — Architecture Overview</h1>
+<p>
+  A Kotlin/JVM implementation of the <strong>BATMAN</strong> (Better Approach To Mobile Ad-hoc Networking)
+  routing algorithm targeting heterogeneous, band-limited radio meshes. Each node discovers routes by
+  flooding lightweight OGMs; no node ever computes full paths — only next-hop decisions are made locally.
+</p>
+
+<!-- ═══════════════════════════════════════════════════════════ -->
+<h2>1. Component Map</h2>
+<p>The main runtime components and their relationships:</p>
+
+<div class="mermaid">
+graph TD
+    subgraph BatmanRouter["BatmanRouter (one per node)"]
+        RX["receiveLoop\nper Link"]
+        OGM["ogmLoop\nper Link"]
+        TX["txLoop\nper Link"]
+        PURGE["neighborPurgeLoop"]
+        EVICT["staleEvictionLoop"]
+    end
+
+    subgraph State
+        NT["neighborTable\nConcurrentHashMap&lt;NodeId, NeighborEntry&gt;"]
+        MT["MulticastTree\nConcurrentHashMap&lt;GroupId, links&gt;"]
+        SC["SeenWindowCache\nBitSet sliding window per originator"]
+        GRP["localGroups / ownedGroups"]
+    end
+
+    subgraph IO
+        LINK["Link interface\n(serial, UDP, …)"]
+        TXQ["TxQueue\nTreeSet + CompletableDeferred waiters"]
+        CODEC["Codec\nencode() / decode()"]
+    end
+
+    RX -->|"decode(raw)"| CODEC
+    CODEC -->|Frame| RX
+    RX -->|"markIfNew()"| SC
+    RX -->|"update"| NT
+    RX -->|"registerLink()"| MT
+    RX -->|"enqueue(TxEntry)"| TXQ
+
+    OGM -->|"encode(OgmFrame)"| CODEC
+    OGM -->|"enqueue(TxEntry)"| TXQ
+
+    TX -->|"pollFor(link)"| TXQ
+    TX -->|"broadcast(bytes)"| LINK
+    LINK -->|"frames: Flow"| RX
+
+    PURGE -->|"remove stale"| NT
+    EVICT -->|"evictStale()"| MT
+</div>
+
+<!-- ═══════════════════════════════════════════════════════════ -->
+<h2>2. OGM Flooding &amp; Route Discovery</h2>
+<p>
+  Every node periodically broadcasts an <strong>Originator Message (OGM)</strong> on each of its links.
+  Relay nodes re-broadcast OGMs they haven't seen before, decrementing TTL and updating
+  <code>senderId</code> to their own ID. The routing metric is implicit: a route's quality is the
+  <em>highest TTL remaining</em> when the OGM arrives, which equals <em>15 − hop-count</em>.
+</p>
+
+<div class="mermaid">
+sequenceDiagram
+    participant A as Node A (originator)
+    participant B as Node B (relay)
+    participant C as Node C (relay)
+    participant D as Node D
+
+    Note over A: ogmLoop fires every ogmInterval
+    A->>B: OGM {origId=A, senderId=A, seq=N, ttl=15}
+    A->>C: OGM {origId=A, senderId=A, seq=N, ttl=15}
+
+    Note over B: seenCache miss → relay with jitter
+    B->>C: OGM {origId=A, senderId=B, seq=N, ttl=14}
+    B->>D: OGM {origId=A, senderId=B, seq=N, ttl=14}
+
+    Note over C: heard 2 copies → P(relay)=1/2
+    C-->>D: OGM {origId=A, senderId=C, seq=N, ttl=13}
+
+    Note over D: neighborTable[A] = {nextHop=B, ttl=14, link=…}
+</div>
+
+<h3>Relay suppression</h3>
+<ul>
+  <li><strong>Deduplication:</strong> <code>SeenWindowCache</code> uses a 64-bit sliding BitSet per originator,
+    handling UShort (0–65535) wraparound via modular signed difference.</li>
+  <li><strong>Jitter:</strong> relay is delayed by <code>ogmInterval / (8 + rand(0,3))</code> so that
+    copies from different paths arrive within the window and are counted.</li>
+  <li><strong>Probabilistic suppression:</strong> after the jitter window, if <em>N</em> copies were heard,
+    relay probability is <code>1/N</code> — naturally suppresses redundant relays in dense meshes.</li>
+  <li><strong>No relay-back:</strong> OGMs are never re-sent on the link they arrived on.</li>
+</ul>
+
+<!-- ═══════════════════════════════════════════════════════════ -->
+<h2>3. Multicast Groups &amp; Spanning Tree</h2>
+<p>
+  Multicast is tree-routed, not flooded. The tree is built implicitly by member beacons travelling
+  toward the group owner — every relay node on the path records itself as a tree branch.
+</p>
+
+<div class="mermaid">
+sequenceDiagram
+    participant Owner
+    participant Relay
+    participant Member
+
+    Note over Owner: createGroup() → GroupId(owner=Owner, seq=0)
+    Owner->>Relay: InviteFrame {dst=Member}
+    Relay->>Member: InviteFrame {dst=Member}
+    Member->>Member: joinGroup() → start beaconLoop
+
+    loop every beaconInterval
+        Member->>Relay: BeaconFrame {groupId, nextHop=Relay}
+        Note over Relay: registerLink(groupId, incomingLink)
+        Note over Relay: registerLink(groupId, outgoingLink)
+        Relay->>Owner: BeaconFrame {groupId, nextHop=Owner}
+        Note over Owner: registerLink(groupId, incomingLink)
+    end
+
+    Note over Owner: MulticastTree built ✓
+
+    Owner->>Relay: MulticastFrame {groupId, payload}
+    Note over Relay: linksFor(groupId, except=incomingLink)
+    Relay->>Member: MulticastFrame {groupId, payload}
+</div>
+
+<h3>Stale branch eviction</h3>
+<p>
+  Each <code>LinkEntry</code> in <code>MulticastTree</code> records <code>lastSeen</code>.
+  A background loop calls <code>evictStale(threshold)</code> every <code>threshold/3</code>;
+  branches whose member stopped sending beacons are pruned after at most <code>threshold</code> time.
+</p>
+
+<!-- ═══════════════════════════════════════════════════════════ -->
+<h2>4. Transmit Queue</h2>
+<p>
+  A central <strong>pull-model</strong> queue decouples producers (routing logic) from consumers
+  (per-link TX coroutines). Each link drains at its own pace; a slow radio never blocks a fast one.
+</p>
+
+<div class="mermaid">
+graph LR
+    subgraph Producers
+        P1["ogmLoop"]
+        P2["handleOgm relay"]
+        P3["send()"]
+        P4["sendMulticast()"]
+        P5["handleBeacon relay"]
+    end
+
+    subgraph TxQueue
+        TS["TreeSet&lt;TxEntry&gt;\nordered by Rules"]
+        WM["waiters\nMap&lt;linkId, Deferred&gt;"]
+    end
+
+    subgraph TX Coroutines
+        T1["txLoop(linkA)\npollFor(linkA)"]
+        T2["txLoop(linkB)\npollFor(linkB)"]
+    end
+
+    P1 & P2 & P3 & P4 & P5 -->|"enqueue(TxEntry)"| TS
+    TS -->|"first eligible"| T1
+    TS -->|"first eligible"| T2
+    WM -.->|"direct handoff\nif waiter waiting"| T1
+    WM -.->|"direct handoff\nif waiter waiting"| T2
+</div>
+
+<h3>Rule-based ordering</h3>
+<p>
+  <code>TxQueue</code> accepts a <code>List&lt;Rule&gt;</code> (each a <code>Comparator&lt;TxEntry&gt;</code>)
+  composed in order. The defaults are:
+</p>
+<ol>
+  <li><strong>controlFirst</strong> — OGM, BEACON, INVITE before MULTICAST, DATA</li>
+  <li><strong>olderFirst</strong> — FIFO within the same class</li>
+  <li><strong>insertionOrderFirst</strong> — strict total-order tiebreaker for TreeSet correctness</li>
+</ol>
+
+<h3>Eligible-link work stealing</h3>
+<p>
+  Each <code>TxEntry</code> carries a <code>Set&lt;Link&gt;</code> of eligible radios rather than
+  a single target. The first TX coroutine to call <code>pollFor</code> for any eligible link claims
+  the frame exclusively. This enables natural load-balancing across redundant paths at zero extra cost.
+</p>
+
+<!-- ═══════════════════════════════════════════════════════════ -->
+<h2>5. Wire Format</h2>
+<p>
+  All frames use a compact bit-packed layout. NodeIds are 12 bits (max 4095 nodes),
+  TTL is 4 bits (max 15 hops), and the frame type occupies the upper nibble of byte 0.
+  Authentication vs. encryption is a link-level property — no per-frame flag is needed.
+</p>
+
+<table>
+  <tr><th>Frame</th><th>Size</th><th>Savings vs. naïve 16-bit layout</th><th>Byte 0 upper nibble (type)</th></tr>
+  <tr><td>OGM</td><td>6 B</td><td>−2 B</td><td>0x0</td></tr>
+  <tr><td>DataFrame</td><td>7 + n B</td><td>−3 B</td><td>0x1</td></tr>
+  <tr><td>BeaconFrame</td><td>7 B</td><td>−2 B</td><td>0x2</td></tr>
+  <tr><td>MulticastFrame</td><td>9 + n B</td><td>−3 B</td><td>0x3</td></tr>
+  <tr><td>InviteFrame</td><td>9 B</td><td>−2 B</td><td>0x4</td></tr>
+</table>
+
+<p>Byte 0 layout shared by all frame types:</p>
+<pre>
+  bit 7–4 : type (4 bits, values 0–4 used, 5–15 reserved)
+  bit 3–0 : firstId[11:8]  (high nibble of leading 12-bit identifier)
+</pre>
+
+<p>OGM layout example (6 bytes):</p>
+<pre>
+  B0: [type:4 | origId[11:8]:4]
+  B1: origId[7:0]
+  B2: [sendId[11:8]:4 | ttl[3:0]:4]
+  B3: sendId[7:0]
+  B4: seqNum[15:8]
+  B5: seqNum[7:0]
+</pre>
+
+<p>
+  GroupId is transmitted as its constituent fields (owner 12-bit + seq 16-bit) rather than
+  as a raw 32-bit UInt, saving 4 bits. In memory it is a proper data class:
+  <code>data class GroupId(val owner: NodeId, val seq: UShort)</code>.
+</p>
+
+<!-- ═══════════════════════════════════════════════════════════ -->
+<h2>6. Key Design Decisions</h2>
+
+<table>
+  <tr><th>Decision</th><th>Rationale</th></tr>
+  <tr>
+    <td>OGM interval as routing metric</td>
+    <td>Slower links emit OGMs less frequently → naturally accumulate lower TTL at destination → preferred only when no faster path exists. Zero extra overhead.</td>
+  </tr>
+  <tr>
+    <td>Pull-model TxQueue</td>
+    <td>Each link's TX coroutine suspends when idle and wakes on demand via <code>CompletableDeferred</code>. Slow radios never block fast ones; no polling or busy-waiting.</td>
+  </tr>
+  <tr>
+    <td>1/N relay probability</td>
+    <td>In dense subnets where N nodes all hear the same OGM, only 1/N relay on average — equivalent to a single relay in expectation, dramatically reducing OGM storms.</td>
+  </tr>
+  <tr>
+    <td>Beacon-based multicast tree</td>
+    <td>Avoids flooding for multicast by having members build the tree themselves with periodic beacons. The owner only needs to forward along registered branches.</td>
+  </tr>
+  <tr>
+    <td>BitSet sliding window for dedup</td>
+    <td>O(1) per lookup, bounded memory (64 bits per originator), handles UShort wraparound correctly via modular signed difference.</td>
+  </tr>
+  <tr>
+    <td>12-bit NodeId cap</td>
+    <td>Mesh networks with band-limited radios rarely exceed a few hundred nodes. 12 bits (4095 nodes) is sufficient and saves 1 byte per NodeId field on the wire.</td>
+  </tr>
+</table>
+
+<div class="note">
+  <strong>Neighbour table expiry:</strong> each entry expires after
+  <code>ogmInterval × neighborPurgeMultiplier</code> (default 3×) without a refreshing OGM.
+  This mirrors the batman-adv PURGE_TIMEOUT and ensures stale routes are evicted automatically
+  after a node goes silent.
+</div>
+
+</body>
+</html>
