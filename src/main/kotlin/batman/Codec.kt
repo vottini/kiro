@@ -44,21 +44,23 @@ private const val TYPE_INVITE    = 4
  *                B5=[ttl[3:0]:4|spare:4]            B6=payloadLen(8)
  *                payload[0..n-1]
  *
- * BEACON    7    B0=[type:4|nextHop[11:8]:4]       B1=nextHop[7:0]
- *                B2=[srcId[11:8]:4|owner[11:8]:4]  B3=srcId[7:0]   B4=owner[7:0]
- *                B5=gseq[15:8]                      B6=gseq[7:0]
+ * BEACON    9    B0=[type:4|nextHop[11:8]:4]         B1=nextHop[7:0]
+ *                B2=[srcId[11:8]:4|owner[11:8]:4]    B3=srcId[7:0]   B4=owner[7:0]
+ *                B5=gseq[15:8]                        B6=gseq[7:0]
+ *                B7=[activeRoot[11:8]:4|spare:4]      B8=activeRoot[7:0]
  *
- * MULTICAST 9+n  B0=[type:4|srcId[11:8]:4]         B1=srcId[7:0]
- *                B2=[owner[11:8]:4|ttl[3:0]:4]      B3=owner[7:0]
- *                B4=gseq[15:8]                      B5=gseq[7:0]
- *                B6=mcastSeq[15:8]                  B7=mcastSeq[7:0]
+ * MULTICAST 9+n  B0=[type:4|srcId[11:8]:4]           B1=srcId[7:0]
+ *                B2=[owner[11:8]:4|ttl[3:0]:4]        B3=owner[7:0]
+ *                B4=gseq[15:8]                        B5=gseq[7:0]
+ *                B6=mcastSeq[15:8]                    B7=mcastSeq[7:0]
  *                B8=payloadLen(8)
  *                payload[0..n-1]
  *
- * INVITE    9    B0=[type:4|nextHop[11:8]:4]       B1=nextHop[7:0]
- *                B2=[srcId[11:8]:4|dstId[11:8]:4]  B3=srcId[7:0]   B4=dstId[7:0]
- *                B5=[owner[11:8]:4|spare:4]         B6=owner[7:0]
- *                B7=gseq[15:8]                      B8=gseq[7:0]
+ * INVITE    9+2d B0=[type:4|nextHop[11:8]:4]         B1=nextHop[7:0]
+ *                B2=[srcId[11:8]:4|dstId[11:8]:4]    B3=srcId[7:0]   B4=dstId[7:0]
+ *                B5=[owner[11:8]:4|deputyCount:4]     B6=owner[7:0]   (spare nibble = count)
+ *                B7=gseq[15:8]                        B8=gseq[7:0]
+ *                per deputy i: [dep[11:8]:4|spare:4], dep[7:0]        (2 bytes × d deputies)
  * ```
  *
  * BEACON and INVITE encode the [GroupId] as its constituent owner (12-bit) and
@@ -130,10 +132,11 @@ private fun encodeData(frame: Frame.DataFrame): ByteArray {
 }
 
 /**
- * BEACON: 7 bytes.
+ * BEACON: 9 bytes.
  *
- * GroupId is unpacked into owner (12-bit) and group-sequence (16-bit) rather
- * than storing the raw 32-bit value with 4 wasted bits.
+ * GroupId is unpacked into owner (12-bit) and group-sequence (16-bit).
+ * [Frame.BeaconFrame.activeRoot] occupies B7–B8: relay nodes stop forwarding
+ * when their own NodeId matches activeRoot, without needing local group state.
  *
  * B0: [type:4|nextHop[11:8]:4]
  * B1: nextHop[7:0]
@@ -142,12 +145,15 @@ private fun encodeData(frame: Frame.DataFrame): ByteArray {
  * B4: owner[7:0]
  * B5: gseq[15:8]
  * B6: gseq[7:0]
+ * B7: [activeRoot[11:8]:4|spare:4]
+ * B8: activeRoot[7:0]
  */
 private fun encodeBeacon(frame: Frame.BeaconFrame): ByteArray {
-    val nextHop = frame.nextHop.toInt()         and 0xFFF
-    val srcId   = frame.srcId.toInt()           and 0xFFF
-    val owner   = frame.groupId.owner.toInt() and 0xFFF
-    val gseq    = frame.groupId.seq.toInt()   and 0xFFFF
+    val nextHop    = frame.nextHop.toInt()       and 0xFFF
+    val srcId      = frame.srcId.toInt()         and 0xFFF
+    val owner      = frame.groupId.owner.toInt() and 0xFFF
+    val gseq       = frame.groupId.seq.toInt()   and 0xFFFF
+    val activeRoot = frame.activeRoot.toInt()     and 0xFFF
     return byteArrayOf(
         ((TYPE_BEACON shl 4) or (nextHop ushr 8)).toByte(),
         (nextHop and 0xFF).toByte(),
@@ -155,7 +161,9 @@ private fun encodeBeacon(frame: Frame.BeaconFrame): ByteArray {
         (srcId and 0xFF).toByte(),
         (owner and 0xFF).toByte(),
         (gseq ushr 8).toByte(),
-        (gseq and 0xFF).toByte()
+        (gseq and 0xFF).toByte(),
+        ((activeRoot ushr 8) shl 4).toByte(),
+        (activeRoot and 0xFF).toByte()
     )
 }
 
@@ -195,35 +203,45 @@ private fun encodeMulticast(frame: Frame.MulticastFrame): ByteArray {
 }
 
 /**
- * INVITE: 9 bytes.
+ * INVITE: 9 + 2×d bytes (d = number of deputies, 0–15).
+ *
+ * The spare nibble in B5 is repurposed for the deputy count, so frames with
+ * zero deputies remain 9 bytes — identical to the previous layout.
  *
  * B0: [type:4|nextHop[11:8]:4]
  * B1: nextHop[7:0]
  * B2: [srcId[11:8]:4|dstId[11:8]:4]
  * B3: srcId[7:0]
  * B4: dstId[7:0]
- * B5: [owner[11:8]:4|spare:4]
+ * B5: [owner[11:8]:4|deputyCount:4]
  * B6: owner[7:0]
  * B7: gseq[15:8]
  * B8: gseq[7:0]
+ * per deputy i: [dep[11:8]:4|spare:4], dep[7:0]
  */
 private fun encodeInvite(frame: Frame.InviteFrame): ByteArray {
-    val nextHop = frame.nextHop.toInt()         and 0xFFF
-    val srcId   = frame.srcId.toInt()           and 0xFFF
-    val dstId   = frame.dstId.toInt()           and 0xFFF
-    val owner   = frame.groupId.owner.toInt() and 0xFFF
-    val gseq    = frame.groupId.seq.toInt()   and 0xFFFF
-    return byteArrayOf(
-        ((TYPE_INVITE shl 4) or (nextHop ushr 8)).toByte(),
-        (nextHop and 0xFF).toByte(),
-        ((srcId ushr 8 shl 4) or (dstId ushr 8)).toByte(),
-        (srcId and 0xFF).toByte(),
-        (dstId and 0xFF).toByte(),
-        ((owner ushr 8) shl 4).toByte(),
-        (owner and 0xFF).toByte(),
-        (gseq ushr 8).toByte(),
-        (gseq and 0xFF).toByte()
-    )
+    val nextHop  = frame.nextHop.toInt()         and 0xFFF
+    val srcId    = frame.srcId.toInt()           and 0xFFF
+    val dstId    = frame.dstId.toInt()           and 0xFFF
+    val owner    = frame.groupId.owner.toInt()   and 0xFFF
+    val gseq     = frame.groupId.seq.toInt()     and 0xFFFF
+    val deputies = frame.deputies
+    return ByteArray(9 + 2 * deputies.size).also { b ->
+        b[0] = ((TYPE_INVITE shl 4) or (nextHop ushr 8)).toByte()
+        b[1] = (nextHop and 0xFF).toByte()
+        b[2] = ((srcId ushr 8 shl 4) or (dstId ushr 8)).toByte()
+        b[3] = (srcId and 0xFF).toByte()
+        b[4] = (dstId and 0xFF).toByte()
+        b[5] = ((owner ushr 8 shl 4) or (deputies.size and 0xF)).toByte()
+        b[6] = (owner and 0xFF).toByte()
+        b[7] = (gseq ushr 8).toByte()
+        b[8] = (gseq and 0xFF).toByte()
+        deputies.forEachIndexed { i, dep ->
+            val d = dep.toInt() and 0xFFF
+            b[9 + 2 * i]     = ((d ushr 8) shl 4).toByte()
+            b[9 + 2 * i + 1] = (d and 0xFF).toByte()
+        }
+    }
 }
 
 /**
@@ -286,16 +304,18 @@ private fun decodeData(raw: ByteArray, b0: Int): Frame? {
 }
 
 private fun decodeBeacon(raw: ByteArray, b0: Int): Frame? {
-    if (raw.size < 7) return null
-    val nextHop = ((b0 and 0xF) shl 8) or (raw[1].toInt() and 0xFF)
-    val b2      = raw[2].toInt() and 0xFF
-    val srcId   = ((b2 ushr 4) shl 8) or (raw[3].toInt() and 0xFF)
-    val owner   = ((b2 and 0xF) shl 8) or (raw[4].toInt() and 0xFF)
-    val gseq    = (((raw[5].toInt() and 0xFF) shl 8) or (raw[6].toInt() and 0xFF)).toUShort()
+    if (raw.size < 9) return null
+    val nextHop    = ((b0 and 0xF) shl 8) or (raw[1].toInt() and 0xFF)
+    val b2         = raw[2].toInt() and 0xFF
+    val srcId      = ((b2 ushr 4) shl 8) or (raw[3].toInt() and 0xFF)
+    val owner      = ((b2 and 0xF) shl 8) or (raw[4].toInt() and 0xFF)
+    val gseq       = (((raw[5].toInt() and 0xFF) shl 8) or (raw[6].toInt() and 0xFF)).toUShort()
+    val activeRoot = (((raw[7].toInt() and 0xFF) ushr 4) shl 8) or (raw[8].toInt() and 0xFF)
     return Frame.BeaconFrame(
-        nextHop = nextHop.toUShort(),
-        srcId   = srcId.toUShort(),
-        groupId = GroupId(owner.toUShort(), gseq)
+        nextHop    = nextHop.toUShort(),
+        srcId      = srcId.toUShort(),
+        groupId    = GroupId(owner.toUShort(), gseq),
+        activeRoot = activeRoot.toUShort()
     )
 }
 
@@ -320,17 +340,25 @@ private fun decodeMulticast(raw: ByteArray, b0: Int): Frame? {
 
 private fun decodeInvite(raw: ByteArray, b0: Int): Frame? {
     if (raw.size < 9) return null
-    val nextHop = ((b0 and 0xF) shl 8) or (raw[1].toInt() and 0xFF)
-    val b2      = raw[2].toInt() and 0xFF
-    val srcId   = ((b2 ushr 4) shl 8) or (raw[3].toInt() and 0xFF)
-    val dstId   = ((b2 and 0xF) shl 8) or (raw[4].toInt() and 0xFF)
-    val b5      = raw[5].toInt() and 0xFF
-    val owner   = ((b5 ushr 4) shl 8) or (raw[6].toInt() and 0xFF)
-    val gseq    = (((raw[7].toInt() and 0xFF) shl 8) or (raw[8].toInt() and 0xFF)).toUShort()
+    val nextHop      = ((b0 and 0xF) shl 8) or (raw[1].toInt() and 0xFF)
+    val b2           = raw[2].toInt() and 0xFF
+    val srcId        = ((b2 ushr 4) shl 8) or (raw[3].toInt() and 0xFF)
+    val dstId        = ((b2 and 0xF) shl 8) or (raw[4].toInt() and 0xFF)
+    val b5           = raw[5].toInt() and 0xFF
+    val owner        = ((b5 ushr 4) shl 8) or (raw[6].toInt() and 0xFF)
+    val deputyCount  = b5 and 0xF
+    val gseq         = (((raw[7].toInt() and 0xFF) shl 8) or (raw[8].toInt() and 0xFF)).toUShort()
+    if (raw.size < 9 + 2 * deputyCount) return null
+    val deputies = List(deputyCount) { i ->
+        val hi = (raw[9 + 2 * i].toInt() and 0xFF) ushr 4
+        val lo = raw[9 + 2 * i + 1].toInt() and 0xFF
+        ((hi shl 8) or lo).toUShort()
+    }
     return Frame.InviteFrame(
-        nextHop = nextHop.toUShort(),
-        srcId   = srcId.toUShort(),
-        dstId   = dstId.toUShort(),
-        groupId = GroupId(owner.toUShort(), gseq)
+        nextHop  = nextHop.toUShort(),
+        srcId    = srcId.toUShort(),
+        dstId    = dstId.toUShort(),
+        groupId  = GroupId(owner.toUShort(), gseq),
+        deputies = deputies
     )
 }

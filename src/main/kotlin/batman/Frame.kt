@@ -40,20 +40,24 @@ sealed class Frame {
     data class OgmFrame(val ogm: Ogm) : Frame()
 
     /**
-     * Sent periodically by each group member toward the group owner via unicast routing.
-     * As the beacon travels hop-by-hop, every relay node records both the incoming
-     * and outgoing links in the [MulticastTree], progressively building a spanning
-     * tree rooted at the owner. This tree is later used to route [MulticastFrame]s
-     * efficiently without flooding the entire network.
+     * Sent periodically by each group member toward the current tree root via unicast
+     * routing. As the beacon travels hop-by-hop, every relay node records both the
+     * incoming and outgoing links in the [MulticastTree], progressively building a
+     * spanning tree rooted at [activeRoot]. This tree is later used to route
+     * [MulticastFrame]s efficiently without flooding the entire network.
      *
      * @property nextHop Link-layer next hop for this unicast frame (changes at each relay).
      * @property srcId The group member that originated this beacon (stays constant).
      * @property groupId Identifies which group's tree is being maintained.
+     * @property activeRoot The node currently acting as tree root — normally the group
+     *   owner, but promoted to a deputy if the owner is unreachable. Relay nodes stop
+     *   forwarding the beacon when their own [NodeId] matches this field.
      */
     data class BeaconFrame(
         val nextHop: NodeId,
         val srcId: NodeId,
-        val groupId: GroupId
+        val groupId: GroupId,
+        val activeRoot: NodeId
     ) : Frame()
 
     /**
@@ -66,12 +70,17 @@ sealed class Frame {
      * @property srcId The group owner (stays constant).
      * @property dstId The node being invited (stays constant).
      * @property groupId The group the invitee is being asked to join.
+     * @property deputies Ordered list of fallback tree roots. If the primary owner
+     *   becomes unreachable, members try each deputy in order — the first one with
+     *   a known route becomes the new [BeaconFrame.activeRoot]. Stored by the
+     *   invitee in [BatmanRouter.groupDeputies] for use by [BatmanRouter.beaconLoop].
      */
     data class InviteFrame(
         val nextHop: NodeId,
         val srcId: NodeId,
         val dstId: NodeId,
-        val groupId: GroupId
+        val groupId: GroupId,
+        val deputies: List<NodeId> = emptyList()
     ) : Frame()
 
     /**

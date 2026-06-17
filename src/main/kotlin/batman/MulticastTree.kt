@@ -60,39 +60,63 @@ class MulticastTree {
      * Inner key: [Link.id] (String) — using the string ID rather than the Link
      * object avoids identity-equality pitfalls if Link instances are recreated.
      */
-    private val state = ConcurrentHashMap<GroupId, ConcurrentHashMap<String, LinkEntry>>()
+    private val upstream   = ConcurrentHashMap<GroupId, ConcurrentHashMap<String, LinkEntry>>()
+    private val downstream = ConcurrentHashMap<GroupId, ConcurrentHashMap<String, LinkEntry>>()
 
-    /**
-     * Records [link] as part of the spanning tree for [groupId], or refreshes
-     * its [LinkEntry.lastSeen] timestamp if it was already registered.
-     *
-     * Called by:
-     *   - Relay nodes when forwarding a [Frame.BeaconFrame] (for both the
-     *     incoming link and the outgoing link toward the owner).
-     *   - The group owner when a beacon arrives at its final destination.
-     *   - Group members at each beacon-loop tick to register the outgoing link
-     *     toward the owner.
-     */
-    fun registerLink(groupId: GroupId, link: Link) {
-        state.getOrPut(groupId) { ConcurrentHashMap() }
+    private fun upsert(
+        map: ConcurrentHashMap<GroupId, ConcurrentHashMap<String, LinkEntry>>,
+        groupId: GroupId,
+        link: Link
+    ) {
+        map.getOrPut(groupId) { ConcurrentHashMap() }
             .compute(link.id) { _, existing ->
-                // Refresh timestamp if present; create a new entry otherwise.
                 existing?.also { it.lastSeen = Instant.now() } ?: LinkEntry(link, Instant.now())
             }
     }
 
     /**
-     * Returns all links registered in [groupId]'s tree, excluding [except].
+     * Records [link] as an upstream link for [groupId] — the direction toward the
+     * tree root. Called by a node when it forwards a beacon onward, or when a leaf
+     * member enqueues its own beacon.
+     */
+    fun registerUpstream(groupId: GroupId, link: Link) = upsert(upstream, groupId, link)
+
+    /**
+     * Records [link] as a downstream link for [groupId] — the direction toward
+     * group members. Called by a relay node when a beacon arrives from below.
+     *
+     * The presence of at least one downstream link for a group means another node
+     * further down the tree is already keeping this node's path to the root alive,
+     * so the relay node itself does not need to originate its own beacon.
+     */
+    fun registerDownstream(groupId: GroupId, link: Link) = upsert(downstream, groupId, link)
+
+    /**
+     * Returns `true` if there is at least one downstream link for [groupId] whose
+     * [LinkEntry.lastSeen] is no older than [within].
+     *
+     * Used by [BatmanRouter.beaconLoop] to decide whether this node can suppress
+     * its own beacon: if a downstream member is actively sending beacons through
+     * this node, its relayed beacons are already keeping the upstream path alive.
+     */
+    fun hasActiveDownstream(groupId: GroupId, within: Duration): Boolean {
+        val cutoff = Instant.now().minus(within.toJavaDuration())
+        return downstream[groupId]?.values?.any { it.lastSeen.isAfter(cutoff) } == true
+    }
+
+    /**
+     * Returns all links registered in [groupId]'s tree (both directions), excluding [except].
      *
      * Used when relaying a [Frame.MulticastFrame]: the [except] link is the one
      * the frame arrived on, so excluding it prevents the frame from being sent
      * back in the direction it came from.
      */
-    fun linksFor(groupId: GroupId, except: Link): Set<Link> =
-        state[groupId]?.values
-            ?.filter { it.link.id != except.id }
-            ?.map { it.link }
-            ?.toSet() ?: emptySet()
+    fun linksFor(groupId: GroupId, except: Link): Set<Link> {
+        val all = mutableMapOf<String, Link>()
+        upstream[groupId]?.values?.forEach   { all[it.link.id] = it.link }
+        downstream[groupId]?.values?.forEach { all[it.link.id] = it.link }
+        return all.values.filter { it.id != except.id }.toSet()
+    }
 
     /**
      * Returns all links registered in [groupId]'s tree with no exclusions.
@@ -100,8 +124,12 @@ class MulticastTree {
      * Used when a node originates a [Frame.MulticastFrame] (i.e. it is not
      * relaying — there is no "incoming link" to exclude).
      */
-    fun allLinksFor(groupId: GroupId): Set<Link> =
-        state[groupId]?.values?.map { it.link }?.toSet() ?: emptySet()
+    fun allLinksFor(groupId: GroupId): Set<Link> {
+        val all = mutableMapOf<String, Link>()
+        upstream[groupId]?.values?.forEach   { all[it.link.id] = it.link }
+        downstream[groupId]?.values?.forEach { all[it.link.id] = it.link }
+        return all.values.toSet()
+    }
 
     /**
      * Removes all [LinkEntry] records whose [LinkEntry.lastSeen] is older than
@@ -114,9 +142,11 @@ class MulticastTree {
      */
     fun evictStale(threshold: Duration) {
         val cutoff = Instant.now().minus(threshold.toJavaDuration())
-        state.forEach { (groupId, links) ->
-            links.entries.removeIf { it.value.lastSeen.isBefore(cutoff) }
-            if (links.isEmpty()) state.remove(groupId)
+        for (map in listOf(upstream, downstream)) {
+            map.forEach { (groupId, links) ->
+                links.entries.removeIf { it.value.lastSeen.isBefore(cutoff) }
+                if (links.isEmpty()) map.remove(groupId)
+            }
         }
     }
 }

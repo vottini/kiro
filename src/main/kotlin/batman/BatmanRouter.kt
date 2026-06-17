@@ -121,6 +121,13 @@ class BatmanRouter(
      */
     private val ownedGroups = ConcurrentHashMap<GroupId, MutableSet<NodeId>>()
 
+    /**
+     * Ordered fallback roots per group, stored when this node joins via an invite.
+     * [beaconLoop] tries [GroupId.owner] first, then each deputy in order, sending
+     * beacons toward the first one that has a known route in [neighborTable].
+     */
+    private val groupDeputies = ConcurrentHashMap<GroupId, List<NodeId>>()
+
     /** Counter for generating unique sequential group IDs on this node (owner role). */
     private val groupSeq = AtomicInteger(0)
 
@@ -197,13 +204,18 @@ class BatmanRouter(
      * Sends a [Frame.InviteFrame] to [memberId] for group [gid].
      * The invited node will call [joinGroup] upon receipt and begin sending beacons,
      * which builds its branch of the multicast spanning tree.
+     *
+     * [deputies] is an ordered list of fallback tree roots. If the primary owner
+     * becomes unreachable, the invitee will beacon toward the first deputy that has
+     * a known route, keeping the spanning tree alive without intervention.
+     *
      * Silently drops if no route to [memberId] is known yet.
      */
-    suspend fun invite(gid: GroupId, memberId: NodeId) {
+    suspend fun invite(gid: GroupId, memberId: NodeId, deputies: List<NodeId> = emptyList()) {
         val route = neighborTable[memberId] ?: return
         ownedGroups[gid]?.add(memberId)
         txQueue.enqueue(TxEntry(
-            frame         = encode(Frame.InviteFrame(route.nextHop, selfId, memberId, gid)),
+            frame         = encode(Frame.InviteFrame(route.nextHop, selfId, memberId, gid, deputies)),
             eligibleLinks = setOf(route.link),
             flavor        = PacketFlavor.INVITE
         ))
@@ -217,12 +229,21 @@ class BatmanRouter(
      * Registers this node as a member of [gid] and starts the beacon loop that
      * maintains this node's branch in the multicast spanning tree.
      *
+     * [deputies] is stored in [groupDeputies] and consulted by [beaconLoop] whenever
+     * the primary owner is unreachable: the first deputy with a known route becomes
+     * the temporary [Frame.BeaconFrame.activeRoot], keeping the tree alive.
+     *
      * [beaconInterval] controls how often beacons are sent. It should be shorter
      * than [staleThreshold] (default: staleThreshold/3) so the tree branch does
      * not expire between refreshes. Slower links may warrant longer intervals.
      */
-    fun joinGroup(gid: GroupId, beaconInterval: Duration = staleThreshold / 3) {
+    fun joinGroup(
+        gid: GroupId,
+        deputies: List<NodeId> = emptyList(),
+        beaconInterval: Duration = staleThreshold / 3
+    ) {
         localGroups.add(gid)
+        if (deputies.isNotEmpty()) groupDeputies[gid] = deputies
         scope.launch { beaconLoop(gid, beaconInterval) }
     }
 
@@ -279,26 +300,52 @@ class BatmanRouter(
     }
 
     /**
-     * Sends a [Frame.BeaconFrame] toward the group owner every [beaconInterval].
+     * Sends a [Frame.BeaconFrame] toward the current active root every [beaconInterval].
      * Relay nodes that forward this beacon record both legs of the path in
      * [MulticastTree], building this node's branch of the spanning tree.
      *
-     * If no route to the owner is known yet, the loop waits one [beaconInterval]
-     * and retries. The loop exits cleanly when [gid] is removed from [localGroups]
-     * (i.e. this node leaves the group).
+     * The active root is resolved by [resolveActiveRoot]: the primary owner is tried
+     * first; if unreachable, deputies from [groupDeputies] are tried in order. If no
+     * candidate is reachable the loop waits one [beaconInterval] and retries.
+     * The loop exits cleanly when [gid] is removed from [localGroups].
+     *
+     * ## Leaf suppression
+     *
+     * A node that is already relaying beacons from downstream members does not need
+     * to originate its own beacon: the relayed beacons already keep the upstream
+     * path alive and register this node's links in the tree. The node suppresses
+     * its own beacon for any tick where [MulticastTree.hasActiveDownstream] returns
+     * true, making it a transparent relay rather than an independent beacon source.
+     * If all downstream members go silent and their branches are evicted, this node
+     * becomes a leaf again and resumes beaconing on the next tick.
      */
     private suspend fun beaconLoop(gid: GroupId, beaconInterval: Duration) {
         while (gid in localGroups) {
-            val route = neighborTable[gid.owner] ?: run { delay(beaconInterval); return@run null } ?: continue
-            // Register the outgoing link on this node's side of the tree branch.
-            multicastTree.registerLink(gid, route.link)
+            if (multicastTree.hasActiveDownstream(gid, beaconInterval * 2)) {
+                // A downstream member is keeping the path alive — suppress our own beacon.
+                delay(beaconInterval)
+                continue
+            }
+            val activeRoot = resolveActiveRoot(gid) ?: run { delay(beaconInterval); return@run null } ?: continue
+            val route = neighborTable[activeRoot]   ?: run { delay(beaconInterval); return@run null } ?: continue
+            multicastTree.registerUpstream(gid, route.link)
             txQueue.enqueue(TxEntry(
-                frame         = encode(Frame.BeaconFrame(route.nextHop, selfId, gid)),
+                frame         = encode(Frame.BeaconFrame(route.nextHop, selfId, gid, activeRoot)),
                 eligibleLinks = setOf(route.link),
                 flavor        = PacketFlavor.BEACON
             ))
             delay(beaconInterval)
         }
+    }
+
+    /**
+     * Returns the first reachable root candidate for [gid]: the primary owner first,
+     * then each deputy in the order they were listed in the invite. Returns `null`
+     * if none of the candidates currently have a route in [neighborTable].
+     */
+    private fun resolveActiveRoot(gid: GroupId): NodeId? {
+        val candidates = listOf(gid.owner) + (groupDeputies[gid] ?: emptyList())
+        return candidates.firstOrNull { neighborTable[it] != null }
     }
 
     /**
@@ -483,29 +530,29 @@ class BatmanRouter(
     }
 
     /**
-     * Handles a [Frame.BeaconFrame] travelling from a group member toward the owner.
+     * Handles a [Frame.BeaconFrame] travelling from a group member toward the active root.
      *
      *  - Drops frames not addressed to this node ([nextHop] check).
-     *  - Registers the incoming link in [multicastTree] for this group — this node
-     *    is on the path between the beacon's source and the owner.
-     *  - If this node is the owner, the tree entry is sufficient; no further relay.
-     *  - Otherwise, registers the outgoing link and forwards the beacon one hop
-     *    closer to the owner, so the next relay node can also record its two links.
+     *  - Registers the incoming link in [multicastTree] — this node is on the path
+     *    between the beacon's source and the active root.
+     *  - If this node IS the active root ([frame.activeRoot] == [selfId]), the tree
+     *    entry is sufficient; no further relay needed.
+     *  - Otherwise, registers the outgoing link and forwards the beacon one hop closer
+     *    to [frame.activeRoot], so the next relay can also record its two links.
      *
-     * After enough beacon cycles, [multicastTree] contains a spanning tree connecting
-     * all members to the owner, which is used to route [Frame.MulticastFrame]s.
+     * Using [frame.activeRoot] (rather than the GroupId's embedded owner) allows the
+     * spanning tree to be rooted at a deputy when the primary owner is offline, without
+     * any relay node needing to know about the deputy list.
      */
     private suspend fun handleBeacon(frame: Frame.BeaconFrame, incomingLink: Link) {
         if (frame.nextHop != selfId) return
 
-        // Record that this link leads toward a member of the group.
-        multicastTree.registerLink(frame.groupId, incomingLink)
+        multicastTree.registerDownstream(frame.groupId, incomingLink)
 
-        if (frame.groupId.owner == selfId) return  // we are the root; tree entry is enough
+        if (frame.activeRoot == selfId) return  // we are the current root; tree entry is enough
 
-        // Relay the beacon one hop closer to the owner, recording the outgoing link too.
-        val route = neighborTable[frame.groupId.owner] ?: return
-        multicastTree.registerLink(frame.groupId, route.link)
+        val route = neighborTable[frame.activeRoot] ?: return
+        multicastTree.registerUpstream(frame.groupId, route.link)
         txQueue.enqueue(TxEntry(
             frame         = encode(frame.copy(nextHop = route.nextHop)),
             eligibleLinks = setOf(route.link),
@@ -523,7 +570,7 @@ class BatmanRouter(
     private suspend fun handleInvite(frame: Frame.InviteFrame) {
         if (frame.nextHop != selfId) return
         if (frame.dstId == selfId) {
-            joinGroup(frame.groupId)
+            joinGroup(frame.groupId, frame.deputies)
             return
         }
         val route = neighborTable[frame.dstId] ?: return
