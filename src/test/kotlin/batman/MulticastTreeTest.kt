@@ -53,11 +53,11 @@ class MulticastTreeTest {
         assertEquals(emptySet(), tree.linksFor(gid, except = linkA))
     }
 
-    @Test fun `multiple links all returned except the excluded one`() {
+    @Test fun `multiple downstream links all returned except the excluded one`() {
         val tree = MulticastTree()
         tree.registerUpstream(gid, linkA)
-        tree.registerUpstream(gid, linkB)
-        tree.registerUpstream(gid, linkC)
+        tree.registerDownstream(gid, linkB)
+        tree.registerDownstream(gid, linkC)
         val result = tree.linksFor(gid, except = linkA)
         assertEquals(setOf(linkB, linkC), result)
     }
@@ -74,7 +74,7 @@ class MulticastTreeTest {
     @Test fun `allLinksFor returns all registered links`() {
         val tree = MulticastTree()
         tree.registerUpstream(gid, linkA)
-        tree.registerUpstream(gid, linkB)
+        tree.registerDownstream(gid, linkB)
         assertEquals(setOf(linkA, linkB), tree.allLinksFor(gid))
     }
 
@@ -83,6 +83,13 @@ class MulticastTreeTest {
         tree.registerUpstream(gid, linkA)
         tree.registerDownstream(gid, linkB)
         assertEquals(setOf(linkA, linkB), tree.allLinksFor(gid))
+    }
+
+    @Test fun `registerUpstream replaces previous upstream link on route change`() {
+        val tree = MulticastTree()
+        tree.registerUpstream(gid, linkA)
+        tree.registerUpstream(gid, linkB)   // route changed: linkA should be evicted immediately
+        assertEquals(setOf(linkB), tree.allLinksFor(gid))
     }
 
     @Test fun `allLinksFor deduplicates a link registered in both directions`() {

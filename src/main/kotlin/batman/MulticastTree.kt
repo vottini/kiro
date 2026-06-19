@@ -75,11 +75,25 @@ class MulticastTree {
     }
 
     /**
-     * Records [link] as an upstream link for [groupId] — the direction toward the
-     * tree root. Called by a node when it forwards a beacon onward, or when a leaf
-     * member enqueues its own beacon.
+     * Records [link] as the sole upstream link for [groupId], replacing any previously
+     * registered upstream link. A node has exactly one upstream path (its current best
+     * route to the active root), so replacing rather than accumulating prevents stale
+     * upstream links from causing duplicate multicast transmissions after a route change.
      */
-    fun registerUpstream(groupId: GroupId, link: Link) = upsert(upstream, groupId, link)
+    fun registerUpstream(groupId: GroupId, link: Link) {
+        upstream.compute(groupId) { _, existing ->
+            val current = existing?.get(link.id)
+            if (current != null) {
+                // Same link already registered — refresh timestamp in place.
+                current.lastSeen = Instant.now()
+                existing
+            } else {
+                // Route changed or first registration — replace the inner map entirely
+                // so no stale upstream links from a previous route remain.
+                ConcurrentHashMap<String, LinkEntry>().also { it[link.id] = LinkEntry(link, Instant.now()) }
+            }
+        }
+    }
 
     /**
      * Records [link] as a downstream link for [groupId] — the direction toward

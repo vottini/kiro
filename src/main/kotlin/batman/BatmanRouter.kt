@@ -489,10 +489,10 @@ class BatmanRouter(
         Random.nextFloat() < 1.0f / hearingCount
 
     /**
-     * Updates [neighborTable] if [ogm] represents a better (higher TTL) path to
-     * its originator than what is currently recorded. Higher TTL means fewer hops
-     * were traversed, so this node prefers the neighbour ([ogm.senderId]) that
-     * delivered the OGM with the most remaining TTL.
+     * Updates [neighborTable] when an OGM from [ogm.originatorId] is received.
+     * If [ogm.ttl] beats the current best, the route is replaced. Otherwise,
+     * [lastSeen] is still refreshed so the entry is not evicted by the purge loop
+     * during stable topologies where the best TTL never changes.
      */
     private fun updateNeighborTable(ogm: Ogm, link: Link) {
         val current = neighborTable[ogm.originatorId]
@@ -504,6 +504,8 @@ class BatmanRouter(
                 lastSeq  = ogm.seqNum,
                 lastSeen = Instant.now()
             )
+        } else {
+            neighborTable[ogm.originatorId] = current.copy(lastSeen = Instant.now(), lastSeq = ogm.seqNum)
         }
     }
 

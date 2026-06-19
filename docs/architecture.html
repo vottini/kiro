@@ -40,15 +40,16 @@ graph TD
         RX["receiveLoop\nper Link"]
         OGM["ogmLoop\nper Link"]
         TX["txLoop\nper Link"]
+        BEACON["beaconLoop\nper joined group"]
         PURGE["neighborPurgeLoop"]
         EVICT["staleEvictionLoop"]
     end
 
     subgraph State
         NT["neighborTable\nConcurrentHashMap&lt;NodeId, NeighborEntry&gt;"]
-        MT["MulticastTree\nConcurrentHashMap&lt;GroupId, links&gt;"]
+        MT["MulticastTree\nupstream + downstream maps per GroupId"]
         SC["SeenWindowCache\nBitSet sliding window per originator"]
-        GRP["localGroups / ownedGroups"]
+        GRP["localGroups / ownedGroups / groupDeputies"]
     end
 
     subgraph IO
@@ -61,8 +62,12 @@ graph TD
     CODEC -->|Frame| RX
     RX -->|"markIfNew()"| SC
     RX -->|"update"| NT
-    RX -->|"registerLink()"| MT
+    RX -->|"registerDownstream()\nregisterUpstream()"| MT
     RX -->|"enqueue(TxEntry)"| TXQ
+
+    BEACON -->|"hasActiveDownstream()?"| MT
+    BEACON -->|"registerUpstream()"| MT
+    BEACON -->|"enqueue(TxEntry)"| TXQ
 
     OGM -->|"encode(OgmFrame)"| CODEC
     OGM -->|"enqueue(TxEntry)"| TXQ
@@ -120,8 +125,30 @@ sequenceDiagram
 <h2>3. Multicast Groups &amp; Spanning Tree</h2>
 <p>
   Multicast is tree-routed, not flooded. The tree is built implicitly by member beacons travelling
-  toward the group owner — every relay node on the path records itself as a tree branch.
+  toward the group root — every relay node on the path records both legs of the beacon's journey in
+  <code>MulticastTree</code>, progressively stitching together a spanning tree.
 </p>
+
+<h3>Tree construction and directional link tracking</h3>
+<p>
+  <code>MulticastTree</code> tracks two independent sets of links per group:
+</p>
+<ul>
+  <li><strong>Downstream</strong> — links from which beacons arrive (toward group members).
+    Registered by <code>registerDownstream</code> when a beacon is received.</li>
+  <li><strong>Upstream</strong> — the single link on which beacons are forwarded toward the root.
+    Registered by <code>registerUpstream</code>, which <em>replaces</em> any previous upstream link
+    rather than accumulating it. This ensures that after a route change, only the current best
+    path is used — old upstream links do not linger and cause duplicate multicast transmissions.</li>
+</ul>
+<p>
+  When a <code>MulticastFrame</code> arrives on a link, <code>linksFor(groupId, except = incomingLink)</code>
+  merges both sets and excludes the incoming link, so the frame flows in all valid directions without echo:
+</p>
+<ul>
+  <li>Arrives <strong>from a member below</strong>: forwarded upstream (toward root) and to sibling downstream branches.</li>
+  <li>Arrives <strong>from the root</strong>: forwarded to all downstream branches only.</li>
+</ul>
 
 <div class="mermaid">
 sequenceDiagram
@@ -130,16 +157,16 @@ sequenceDiagram
     participant Member
 
     Note over Owner: createGroup() → GroupId(owner=Owner, seq=0)
-    Owner->>Relay: InviteFrame {dst=Member}
-    Relay->>Member: InviteFrame {dst=Member}
+    Owner->>Relay: InviteFrame {dst=Member, deputies=[…]}
+    Relay->>Member: InviteFrame {dst=Member, deputies=[…]}
     Member->>Member: joinGroup() → start beaconLoop
 
-    loop every beaconInterval
-        Member->>Relay: BeaconFrame {groupId, nextHop=Relay}
-        Note over Relay: registerLink(groupId, incomingLink)
-        Note over Relay: registerLink(groupId, outgoingLink)
-        Relay->>Owner: BeaconFrame {groupId, nextHop=Owner}
-        Note over Owner: registerLink(groupId, incomingLink)
+    loop every beaconInterval (if leaf or no active downstream)
+        Member->>Relay: BeaconFrame {groupId, activeRoot=Owner, nextHop=Relay}
+        Note over Relay: registerDownstream(groupId, incomingLink)
+        Note over Relay: registerUpstream(groupId, outgoingLink)
+        Relay->>Owner: BeaconFrame {groupId, activeRoot=Owner, nextHop=Owner}
+        Note over Owner: registerDownstream(groupId, incomingLink)
     end
 
     Note over Owner: MulticastTree built ✓
@@ -149,11 +176,61 @@ sequenceDiagram
     Relay->>Member: MulticastFrame {groupId, payload}
 </div>
 
+<h3>Leaf suppression</h3>
+<p>
+  Only <em>leaf</em> nodes need to originate beacons. A relay node whose beacons from downstream
+  members are already flowing through it does not need to send its own — the relayed beacons keep
+  the upstream path alive and keep the relay's links registered in the tree.
+</p>
+<p>
+  At each tick, <code>beaconLoop</code> calls <code>MulticastTree.hasActiveDownstream(groupId, 2 × beaconInterval)</code>.
+  If any downstream link was refreshed within that window, the node skips its own beacon for that cycle.
+  When all downstream members go silent and their entries are evicted, <code>hasActiveDownstream</code>
+  returns false and the node resumes beaconing as a leaf, re-establishing its own branch.
+</p>
+
+<h3>Deputy failover</h3>
+<p>
+  When the group owner is unreachable, the spanning tree has no root to converge toward.
+  To survive this, the owner embeds an ordered <em>deputy list</em> in the <code>InviteFrame</code>
+  sent to each member. Each <code>BeaconFrame</code> carries the <code>activeRoot</code> field —
+  the node currently acting as tree root.
+</p>
+<ul>
+  <li><strong>Member side:</strong> <code>beaconLoop</code> calls <code>resolveActiveRoot</code>, which
+    tries the group owner first, then each deputy in order, returning the first one with a known
+    route in <code>neighborTable</code>. The beacon is sent toward that candidate.</li>
+  <li><strong>Relay side:</strong> relay nodes read <code>frame.activeRoot</code> to know where to
+    forward the beacon. They need no local deputy list — the active root is carried in the frame itself.
+    Forwarding stops when <code>frame.activeRoot == selfId</code>.</li>
+  <li><strong>Convergence:</strong> since all nodes share the same OGM-based reachability view, they
+    independently agree on the same deputy, and the tree reconverges without coordination.</li>
+</ul>
+
+<div class="mermaid">
+sequenceDiagram
+    participant Owner as Owner (offline)
+    participant Deputy as Deputy
+    participant Relay as Relay
+    participant Member as Member
+
+    Note over Owner: owner becomes unreachable
+    Note over Member: resolveActiveRoot() → owner unreachable → try Deputy
+    Member->>Relay: BeaconFrame {activeRoot=Deputy, nextHop=Relay}
+    Note over Relay: forwards toward Deputy (not Owner)
+    Relay->>Deputy: BeaconFrame {activeRoot=Deputy, nextHop=Deputy}
+    Note over Deputy: activeRoot==selfId → stop; tree now rooted here
+
+    Deputy->>Relay: MulticastFrame {groupId, payload}
+    Relay->>Member: MulticastFrame {groupId, payload}
+</div>
+
 <h3>Stale branch eviction</h3>
 <p>
   Each <code>LinkEntry</code> in <code>MulticastTree</code> records <code>lastSeen</code>.
   A background loop calls <code>evictStale(threshold)</code> every <code>threshold/3</code>;
   branches whose member stopped sending beacons are pruned after at most <code>threshold</code> time.
+  Both upstream and downstream entries are evicted independently.
 </p>
 
 <!-- ═══════════════════════════════════════════════════════════ -->
@@ -171,6 +248,7 @@ graph LR
         P3["send()"]
         P4["sendMulticast()"]
         P5["handleBeacon relay"]
+        P6["beaconLoop"]
     end
 
     subgraph TxQueue
@@ -183,7 +261,7 @@ graph LR
         T2["txLoop(linkB)\npollFor(linkB)"]
     end
 
-    P1 & P2 & P3 & P4 & P5 -->|"enqueue(TxEntry)"| TS
+    P1 & P2 & P3 & P4 & P5 & P6 -->|"enqueue(TxEntry)"| TS
     TS -->|"first eligible"| T1
     TS -->|"first eligible"| T2
     WM -.->|"direct handoff\nif waiter waiting"| T1
@@ -220,10 +298,14 @@ graph LR
   <tr><th>Frame</th><th>Size</th><th>Savings vs. naïve 16-bit layout</th><th>Byte 0 upper nibble (type)</th></tr>
   <tr><td>OGM</td><td>6 B</td><td>−2 B</td><td>0x0</td></tr>
   <tr><td>DataFrame</td><td>7 + n B</td><td>−3 B</td><td>0x1</td></tr>
-  <tr><td>BeaconFrame</td><td>7 B</td><td>−2 B</td><td>0x2</td></tr>
+  <tr><td>BeaconFrame</td><td>9 B</td><td>−2 B</td><td>0x2</td></tr>
   <tr><td>MulticastFrame</td><td>9 + n B</td><td>−3 B</td><td>0x3</td></tr>
-  <tr><td>InviteFrame</td><td>9 B</td><td>−2 B</td><td>0x4</td></tr>
+  <tr><td>InviteFrame</td><td>9 + 2d B</td><td>−2 B base</td><td>0x4</td></tr>
 </table>
+
+<p>
+  <em>n</em> = payload bytes; <em>d</em> = number of deputies in the invite (max 15, encoded in a spare nibble).
+</p>
 
 <p>Byte 0 layout shared by all frame types:</p>
 <pre>
@@ -241,8 +323,37 @@ graph LR
   B5: seqNum[7:0]
 </pre>
 
+<p>BeaconFrame layout (9 bytes), including <code>activeRoot</code>:</p>
+<pre>
+  B0: [type:4 | nextHop[11:8]:4]
+  B1: nextHop[7:0]
+  B2: [srcId[11:8]:4  | owner[11:8]:4]
+  B3: srcId[7:0]
+  B4: owner[7:0]
+  B5: groupSeq[15:8]
+  B6: groupSeq[7:0]
+  B7: [activeRoot[11:8]:4 | 0000]
+  B8: activeRoot[7:0]
+</pre>
+
+<p>InviteFrame layout (9 + 2d bytes), with deputy count in a spare nibble:</p>
+<pre>
+  B0: [type:4      | nextHop[11:8]:4]
+  B1: nextHop[7:0]
+  B2: [srcId[11:8]:4  | dstId[11:8]:4]
+  B3: srcId[7:0]
+  B4: dstId[7:0]
+  B5: [owner[11:8]:4  | deputyCount:4]   ← spare nibble carries deputy count (0–15)
+  B6: owner[7:0]
+  B7: groupSeq[15:8]
+  B8: groupSeq[7:0]
+  for each deputy i (2 bytes each):
+    B(9+2i):   [deputy[11:8]:4 | 0000]
+    B(9+2i+1): deputy[7:0]
+</pre>
+
 <p>
-  GroupId is transmitted as its constituent fields (owner 12-bit + seq 16-bit) rather than
+  <code>GroupId</code> is transmitted as its constituent fields (owner 12-bit + seq 16-bit) rather than
   as a raw 32-bit UInt, saving 4 bits. In memory it is a proper data class:
   <code>data class GroupId(val owner: NodeId, val seq: UShort)</code>.
 </p>
@@ -267,6 +378,22 @@ graph LR
   <tr>
     <td>Beacon-based multicast tree</td>
     <td>Avoids flooding for multicast by having members build the tree themselves with periodic beacons. The owner only needs to forward along registered branches.</td>
+  </tr>
+  <tr>
+    <td>Directional MulticastTree (upstream / downstream)</td>
+    <td>Separating upstream (toward root) from downstream (toward members) links allows leaf suppression and prevents stale upstream links — a relay node can suppress its own beacon while still forwarding multicasts correctly in both directions.</td>
+  </tr>
+  <tr>
+    <td>Single upstream link (replace, not accumulate)</td>
+    <td><code>registerUpstream</code> replaces the current upstream link atomically. When the best route to root changes, the old link is discarded immediately rather than lingering until eviction — eliminating duplicate multicast transmissions during route transitions.</td>
+  </tr>
+  <tr>
+    <td>Leaf suppression in beaconLoop</td>
+    <td>A relay node whose downstream members are actively beaconing through it does not need to originate its own beacon — the relayed beacons already keep the upstream path alive. This halves beacon traffic on every intermediate hop in deep trees.</td>
+  </tr>
+  <tr>
+    <td>Deputy failover via activeRoot field</td>
+    <td>Relay nodes need no local deputy list. The current root is carried in each BeaconFrame's <code>activeRoot</code> field. Members independently select the first reachable candidate (owner → deputies in order); since all nodes share the same OGM reachability view they converge on the same choice without coordination.</td>
   </tr>
   <tr>
     <td>BitSet sliding window for dedup</td>
