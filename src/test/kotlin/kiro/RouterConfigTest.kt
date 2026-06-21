@@ -1,4 +1,4 @@
-package batman
+package kiro
 
 import kotlin.test.Test
 import kotlin.test.assertEquals

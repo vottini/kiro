@@ -1,4 +1,4 @@
-# batman
+# kiro
 
 A Kotlin/JVM implementation of the [BATMAN](https://www.open-mesh.org/projects/open-mesh/wiki/BATMANv4) (Better Approach To Mobile Ad-hoc Networking) routing protocol for heterogeneous, band-limited radio meshes.
 
@@ -25,7 +25,7 @@ Add the dependency to your `build.gradle.kts`:
 
 ```kotlin
 dependencies {
-    implementation("batman:batman:1.0-SNAPSHOT")
+    implementation("kiro:kiro:1.0-SNAPSHOT")
 }
 ```
 
@@ -248,7 +248,7 @@ All frames are bit-packed big-endian. Byte 0 always carries the 4-bit type tag i
 
 ## Formal verification
 
-`batman.pml` is a SPIN/Promela model of the routing core on a 3-node linear chain (`N0 — N1 — N2`). Relay suppression is modelled as a non-deterministic choice (over-approximation); weak fairness (`-f`) captures the real protocol's guarantee that relay probability is always > 0.
+`kiro.pml` is a SPIN/Promela model of the routing core on a 3-node linear chain (`N0 — N1 — N2`). Relay suppression is modelled as a non-deterministic choice (over-approximation); weak fairness (`-f`) captures the real protocol's guarantee that relay probability is always > 0.
 
 ```
 LTL property          pan (no flags)   pan -a -f
@@ -258,10 +258,10 @@ delivery_monotone     holds            holds
 ```
 
 ```bash
-spin -a batman.pml && cc -o pan pan.c
+spin -a kiro.pml && cc -o pan pan.c
 ./pan              # safety only
 ./pan -a -f        # all LTL claims with weak fairness
-spin batman.pml    # simulate one execution
+spin kiro.pml    # simulate one execution
 ```
 
 ---

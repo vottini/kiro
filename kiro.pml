@@ -1,4 +1,4 @@
-/* batman.pml — B.A.T.M.A.N. routing core model for SPIN/Promela
+/* kiro.pml — B.A.T.M.A.N. routing core model for SPIN/Promela
  *
  * Topology: 3-node linear chain
  *
@@ -29,10 +29,10 @@
  *   [assert] bounds    holds ✓           holds ✓
  *
  * ── How to run ────────────────────────────────────────────────────────────
- *   spin -a batman.pml && cc -o pan pan.c
+ *   spin -a kiro.pml && cc -o pan pan.c
  *   ./pan              # safety only
  *   ./pan -a -f        # all ltl claims with weak fairness
- *   spin batman.pml    # simulate one execution
+ *   spin kiro.pml    # simulate one execution
  */
 
 #define MAX_TTL  3
