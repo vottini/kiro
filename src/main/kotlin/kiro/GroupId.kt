@@ -1,13 +1,11 @@
 package kiro
 
 /**
- * A multicast group identifier, globally unique within the mesh.
- *
- * Uniqueness is guaranteed without coordination: each node's groups are
- * namespaced under its own [owner] [NodeId], and [seq] is a per-owner
- * counter incremented each time [KiroRouter.createGroup] is called.
- *
- * On the wire the two fields are packed into 28 bits (owner 12 bits,
- * seq 16 bits); see [encode]/[decode] in Codec.kt for the layout.
+ * Opaque multicast group identifier. The library treats this as an uninterpreted
+ * 20-bit unsigned integer. A common application convention is to pack a 12-bit
+ * node id in the upper bits and an 8-bit sequence in the lower bits:
+ *   GroupId((nodeId.toUInt() shl 8) or seq.toUInt())
+ * but the library does not enforce or decode this layout.
  */
-data class GroupId(val owner: NodeId, val seq: UShort)
+@JvmInline
+value class GroupId(val id: UInt)

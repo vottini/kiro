@@ -11,11 +11,9 @@ The library runs entirely at the application layer — no kernel modules, no raw
 - **Distributed hop-by-hop routing** via periodic OGM (Originator Message) broadcasts
 - **Jitter-based relay suppression** — in a dense subnet of N neighbours, expected relays ≈ ln(N) instead of N−1
 - **Beacon-driven multicast spanning trees** — members build the tree themselves; no network-wide flooding
-- **Deputy failover** — multicast groups continue without the owner by promoting a pre-designated deputy
 - **Pull-model transmit queue** with rule-based ordering and per-handle cancellation, replacement and reordering
-- **Compact wire format** — 6 bytes for an OGM, 9 bytes for a beacon, up to 255-byte payloads
+- **Compact wire format** — 6 bytes for an OGM, 8 bytes for a beacon, up to 255-byte payloads
 - **Fully coroutine-native** — every loop suspends instead of polling; slow radios never block fast ones
-- **Formally verified** liveness and safety properties with SPIN/Promela
 
 ---
 
@@ -121,18 +119,17 @@ router.incomingData.collect { (srcId, payload) -> ... }
 
 Multicast is built on a per-group spanning tree. Members send periodic **beacons** toward the group root; every relay node records which links beacons arrive on and which link leads toward the root. Multicast frames then travel the tree in both directions without flooding.
 
-### Creating a group (owner)
+### Creating and joining a group
+
+Group identifiers are opaque 20-bit values chosen by the application. The node designated as root joins with `roots = listOf(selfId)`; members join with `roots` pointing at the root:
 
 ```kotlin
-val gid: GroupId = router.createGroup()
-```
+// Root node — beacons flow toward it, so no beacon loop is started
+val gid = GroupId(0xA01u)   // application-assigned opaque id
+router.joinGroup(gid, roots = listOf(router.selfId))
 
-### Joining a group (member)
-
-Membership information is delivered by the application layer (e.g. embedded in a data message). Once a node knows which group to join, it calls:
-
-```kotlin
-router.joinGroup(gid, deputies = listOf(0x003u), beaconInterval = 30.seconds)
+// Member node — launches a beacon loop toward the root
+router.joinGroup(gid, roots = listOf(rootId), beaconInterval = 30.seconds)
 ```
 
 ### Sending and receiving
@@ -147,9 +144,9 @@ router.incomingMulticast.collect { msg ->
 }
 ```
 
-### Deputy failover
+### Root failover
 
-When the owner goes offline, members independently select the first deputy with a known route. Because all nodes share the same OGM view they converge on the same deputy without coordination. The active root is carried in every `BeaconFrame` so relay nodes need no local deputy list.
+When the primary root goes offline, members independently select the first alternative root with a known route from the `roots` list passed to `joinGroup`. Because all nodes share the same OGM view they converge on the same root without coordination. The active root is carried in every `BeaconFrame` so relay nodes need no local root list.
 
 ---
 
@@ -161,7 +158,7 @@ All outgoing frames pass through `TxQueue` — a sorted, pull-model queue shared
 
 Ordering is controlled by a composable list of `Rule` objects (each a `Comparator<TxEntry>`). The defaults are:
 
-1. `controlFirst` — OGM / BEACON / INVITE before DATA / MULTICAST
+1. `controlFirst` — OGM / BEACON before DATA / MULTICAST
 2. `userPriorityFirst` — lower `userPriority` wins (default 0; client-controlled)
 3. `olderFirst` — FIFO within a priority class
 4. `insertionOrderFirst` — strict total order tiebreaker
@@ -235,8 +232,8 @@ All frames are bit-packed big-endian. Byte 0 always carries the 4-bit type tag i
 |---|---|---|
 | `OgmFrame` | 6 bytes | originatorId(12b) + senderId(12b) + ttl(4b) + seqNum(16b) |
 | `DataFrame` | 7 + n bytes | nextHop(12b) + src(12b) + dst(12b) + ttl(4b) + len(8b) + payload |
-| `BeaconFrame` | 9 bytes | nextHop(12b) + src(12b) + groupId(28b) + activeRoot(12b) |
-| `MulticastFrame` | 9 + n bytes | src(12b) + groupId(28b) + seqNum(16b) + ttl(4b) + len(8b) + payload |
+| `BeaconFrame` | 8 bytes | nextHop(12b) + src(12b) + groupId(20b) + activeRoot(12b) |
+| `MulticastFrame` | 8 + n bytes | src(12b) + groupId(20b) + ttl(4b) + seqNum(16b) + len(8b) + payload |
 
 `Codec.encode` and `Codec.decode` handle serialisation. `decode` returns `null` for malformed or unknown frames; the router silently drops them.
 
@@ -250,4 +247,4 @@ All frames are bit-packed big-endian. Byte 0 always carries the 4-bit type tag i
 
 **Why separate upstream and downstream links in MulticastTree?** It enables two optimisations: leaf suppression (a relay whose downstream members are actively beaconing does not need to send its own beacon) and immediate upstream replacement (when the best route to the root changes, the old upstream link is discarded atomically, preventing duplicate multicast transmissions during reroutes).
 
-**Why deputies carried in BeaconFrame?** Relay nodes need no local configuration. The active root is embedded in every beacon, so any node can forward toward the correct root without knowing the group's deputy list.
+**Why activeRoot carried in BeaconFrame?** Relay nodes need no local configuration. The active root is embedded in every beacon, so any node can forward toward the correct root without knowing the group's root list.

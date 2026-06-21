@@ -49,12 +49,12 @@ data class MulticastMessage(val srcId: NodeId, val groupId: GroupId, val payload
  *
  * ## Multicast groups
  *
- * A group owner calls [createGroup] to obtain a [GroupId]. Members join by calling
- * [joinGroup] directly (membership is managed at the application layer). Each member
- * begins sending periodic [Frame.BeaconFrame]s toward the owner. Relay nodes record
- * both legs of each beacon's path in [multicastTree], building a spanning tree. Any
- * group member or the owner can then call [sendMulticast] to reach all members via
- * tree-based forwarding rather than network-wide flooding.
+ * Members join by calling [joinGroup] directly (membership is managed at the
+ * application layer). Each member begins sending periodic [Frame.BeaconFrame]s
+ * toward the group roots. Relay nodes record both legs of each beacon's path in
+ * [multicastTree], building a spanning tree. Any group member can then call
+ * [sendMulticast] to reach all members via tree-based forwarding rather than
+ * network-wide flooding.
  *
  * ## Concurrency model
  *
@@ -112,18 +112,15 @@ class KiroRouter(
 
     // --- Group membership ---
 
-    /** Set of [GroupId]s this node belongs to, either as owner or as member. */
+    /** Set of [GroupId]s this node belongs to. */
     private val localGroups = ConcurrentHashMap.newKeySet<GroupId>()
 
     /**
-     * Ordered fallback roots per group, stored when this node joins a group.
-     * [beaconLoop] tries [GroupId.owner] first, then each deputy in order, sending
-     * beacons toward the first one that has a known route in [neighborTable].
+     * Ordered root candidates per group, stored when this node joins a group.
+     * [beaconLoop] sends beacons toward the first root that has a known route in
+     * [neighborTable].
      */
-    private val groupDeputies = ConcurrentHashMap<GroupId, List<NodeId>>()
-
-    /** Counter for generating unique sequential group IDs on this node (owner role). */
-    private val groupSeq = AtomicInteger(0)
+    private val groupRoots = ConcurrentHashMap<GroupId, List<NodeId>>()
 
     // --- Public flows ---
 
@@ -178,32 +175,18 @@ class KiroRouter(
     }
 
     // -------------------------------------------------------------------------
-    // Public API — Group management (owner)
-    // -------------------------------------------------------------------------
-
-    /**
-     * Creates a new multicast group owned by this node.
-     * The returned [GroupId] encodes this node's [selfId] in the high 16 bits and
-     * a monotonically increasing sequence number in the low 16 bits, ensuring
-     * global uniqueness without coordination.
-     */
-    fun createGroup(): GroupId {
-        val gid = GroupId(selfId, groupSeq.getAndIncrement().toUShort())
-        localGroups.add(gid)
-        return gid
-    }
-
-    // -------------------------------------------------------------------------
-    // Public API — Group membership (member)
+    // Public API — Group membership
     // -------------------------------------------------------------------------
 
     /**
      * Registers this node as a member of [gid] and starts the beacon loop that
      * maintains this node's branch in the multicast spanning tree.
      *
-     * [deputies] is stored in [groupDeputies] and consulted by [beaconLoop] whenever
-     * the primary owner is unreachable: the first deputy with a known route becomes
-     * the temporary [Frame.BeaconFrame.activeRoot], keeping the tree alive.
+     * [roots] is stored in [groupRoots] and consulted by [beaconLoop]: the first
+     * root with a known route becomes the [Frame.BeaconFrame.activeRoot], keeping
+     * the tree alive. If [selfId] is in [roots], this node IS the root — beacons
+     * flow toward it, not from it, so no beacon loop is launched. If [roots] is
+     * empty, there is no destination to beacon toward and no loop is launched.
      *
      * [beaconInterval] controls how often beacons are sent. It should be shorter
      * than [staleThreshold] (default: staleThreshold/3) so the tree branch does
@@ -211,12 +194,14 @@ class KiroRouter(
      */
     fun joinGroup(
         gid: GroupId,
-        deputies: List<NodeId> = emptyList(),
+        roots: List<NodeId> = emptyList(),
         beaconInterval: Duration = staleThreshold / 3
     ) {
         localGroups.add(gid)
-        if (deputies.isNotEmpty()) groupDeputies[gid] = deputies
-        scope.launch { beaconLoop(gid, beaconInterval) }
+        if (roots.isNotEmpty()) groupRoots[gid] = roots
+        if (roots.isNotEmpty() && selfId !in roots) {
+            scope.launch { beaconLoop(gid, beaconInterval) }
+        }
     }
 
     /**
@@ -233,7 +218,7 @@ class KiroRouter(
     fun leaveGroup(gid: GroupId): Boolean {
         val wasMember = localGroups.remove(gid)
         if (!wasMember) return false
-        groupDeputies.remove(gid)
+        groupRoots.remove(gid)
         // Tree state is NOT cleared here: if this node sits between remaining members,
         // their beacons still flow through it and handleBeacon keeps the relay entries
         // fresh. Stale entries are pruned naturally by staleEvictionLoop once beacons stop.
@@ -297,9 +282,9 @@ class KiroRouter(
      * Relay nodes that forward this beacon record both legs of the path in
      * [MulticastTree], building this node's branch of the spanning tree.
      *
-     * The active root is resolved by [resolveActiveRoot]: the primary owner is tried
-     * first; if unreachable, deputies from [groupDeputies] are tried in order. If no
-     * candidate is reachable the loop waits one [beaconInterval] and retries.
+     * The active root is resolved by [resolveActiveRoot]: the first root with a
+     * known route becomes the [Frame.BeaconFrame.activeRoot]. If no candidate is
+     * reachable the loop waits one [beaconInterval] and retries.
      * The loop exits cleanly when [gid] is removed from [localGroups].
      *
      * ## Leaf suppression
@@ -332,12 +317,12 @@ class KiroRouter(
     }
 
     /**
-     * Returns the first reachable root candidate for [gid]: the primary owner first,
-     * then each deputy in the order they were listed in the invite. Returns `null`
-     * if none of the candidates currently have a route in [neighborTable].
+     * Returns the first reachable root candidate for [gid].
+     * Returns `null` if no candidates are registered or none currently has a route
+     * in [neighborTable].
      */
     private fun resolveActiveRoot(gid: GroupId): NodeId? {
-        val candidates = listOf(gid.owner) + (groupDeputies[gid] ?: emptyList())
+        val candidates = groupRoots[gid] ?: return null
         return candidates.firstOrNull { neighborTable[it] != null }
     }
 
@@ -543,9 +528,9 @@ class KiroRouter(
      *  - Otherwise, registers the outgoing link and forwards the beacon one hop closer
      *    to [frame.activeRoot], so the next relay can also record its two links.
      *
-     * Using [frame.activeRoot] (rather than the GroupId's embedded owner) allows the
-     * spanning tree to be rooted at a deputy when the primary owner is offline, without
-     * any relay node needing to know about the deputy list.
+     * Using [frame.activeRoot] (rather than any GroupId-embedded field) allows the
+     * spanning tree to be rooted at any designated root node, without any relay node
+     * needing to know about the group's root list.
      */
     private suspend fun handleBeacon(frame: Frame.BeaconFrame, incomingLink: Link) {
         if (frame.nextHop != selfId) return

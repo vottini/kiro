@@ -31,13 +31,13 @@ class CodecTest {
     private fun beacon(
         nextHop: UShort = 3u,
         src: UShort = 7u,
-        gid: GroupId = GroupId(10u, 1u),
+        gid: GroupId = GroupId(0xA01u),   // 10 shl 8 or 1
         activeRoot: UShort = 10u
     ) = Frame.BeaconFrame(nextHop, src, gid, activeRoot)
 
     private fun multicast(
         src: UShort = 2u,
-        gid: GroupId = GroupId(10u, 1u),
+        gid: GroupId = GroupId(0xA01u),   // 10 shl 8 or 1
         seq: UShort = 42u,
         ttl: UByte = 5u,
         payload: ByteArray = byteArrayOf(0xAA.toByte(), 0xBB.toByte())
@@ -138,23 +138,22 @@ class CodecTest {
         }
 
         @Test fun `round-trip max field values`() {
-            val f = beacon(nextHop = 0xFFFu, src = 0xFFFu, gid = GroupId(0xFFFu, 0xFFFFu), activeRoot = 0xFFFu)
+            val f = beacon(nextHop = 0xFFFu, src = 0xFFFu, gid = GroupId(0xFFFFFu), activeRoot = 0xFFFu)
             assertEquals(f, roundTrip(f))
         }
 
         @Test fun `round-trip zero values`() {
-            val f = beacon(nextHop = 0u, src = 0u, gid = GroupId(0u, 0u), activeRoot = 0u)
+            val f = beacon(nextHop = 0u, src = 0u, gid = GroupId(0u), activeRoot = 0u)
             assertEquals(f, roundTrip(f))
         }
 
-        @Test fun `round-trip activeRoot different from group owner`() {
-            // Deputy scenario: group owned by node 10 but activeRoot is deputy 99
-            val f = beacon(gid = GroupId(10u, 0u), activeRoot = 99u)
+        @Test fun `round-trip activeRoot differs from group id`() {
+            val f = beacon(gid = GroupId(0xA00u), activeRoot = 99u)
             assertEquals(f, roundTrip(f))
         }
 
-        @Test fun `encoded length is 9 bytes`() {
-            assertEquals(9, encode(beacon()).size)
+        @Test fun `encoded length is 8 bytes`() {
+            assertEquals(8, encode(beacon()).size)
         }
 
         @Test fun `type nibble is TYPE_BEACON (2)`() {
@@ -162,7 +161,7 @@ class CodecTest {
         }
 
         @Test fun `truncated frame decodes to null`() {
-            assertNull(decode(encode(beacon()).copyOf(8)))
+            assertNull(decode(encode(beacon()).copyOf(7)))
         }
     }
 
@@ -188,7 +187,7 @@ class CodecTest {
         @Test fun `round-trip boundary values`() {
             val f = multicast(
                 src = 0xFFFu,
-                gid = GroupId(0xFFFu, 0xFFFFu),
+                gid = GroupId(0xFFFFFu),
                 seq = 0xFFFFu,
                 ttl = 15u,
                 payload = ByteArray(255) { 0xFF.toByte() }
@@ -201,8 +200,8 @@ class CodecTest {
             assertArrayEquals(f.payload, decoded.payload)
         }
 
-        @Test fun `encoded length is 9 + payload bytes`() {
-            assertEquals(11, encode(multicast(payload = ByteArray(2))).size)
+        @Test fun `encoded length is 8 + payload bytes`() {
+            assertEquals(10, encode(multicast(payload = ByteArray(2))).size)
         }
 
         @Test fun `type nibble is TYPE_MULTICAST (3)`() {
@@ -210,7 +209,7 @@ class CodecTest {
         }
 
         @Test fun `truncated frame decodes to null`() {
-            assertNull(decode(encode(multicast()).copyOf(8)))
+            assertNull(decode(encode(multicast()).copyOf(7)))
         }
     }
 

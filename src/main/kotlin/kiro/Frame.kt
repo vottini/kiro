@@ -49,8 +49,7 @@ sealed class Frame {
      * @property nextHop Link-layer next hop for this unicast frame (changes at each relay).
      * @property srcId The group member that originated this beacon (stays constant).
      * @property groupId Identifies which group's tree is being maintained.
-     * @property activeRoot The node currently acting as tree root — normally the group
-     *   owner, but promoted to a deputy if the owner is unreachable. Relay nodes stop
+     * @property activeRoot The node currently acting as tree root. Relay nodes stop
      *   forwarding the beacon when their own [NodeId] matches this field.
      */
     data class BeaconFrame(
@@ -62,7 +61,7 @@ sealed class Frame {
 
     /**
      * A group multicast message, routed along the spanning tree built by [BeaconFrame]s.
-     * Any group member or the owner can originate a multicast; intermediate nodes
+     * Any group member or the root can originate a multicast; intermediate nodes
      * forward it only on links registered in the [MulticastTree] for this group,
      * excluding the link it arrived on (to prevent echo).
      *

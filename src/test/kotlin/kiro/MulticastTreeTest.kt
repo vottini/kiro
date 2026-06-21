@@ -20,7 +20,7 @@ class MulticastTreeTest {
         override val frames: Flow<ByteArray> = emptyFlow()
     }
 
-    private val gid = GroupId(owner = 1u, seq = 0u)
+    private val gid = GroupId(1u)
     private val linkA = link("A")
     private val linkB = link("B")
     private val linkC = link("C")
@@ -44,7 +44,7 @@ class MulticastTreeTest {
 
     @Test fun `linksFor returns empty set for unknown group`() {
         val tree = MulticastTree()
-        assertEquals(emptySet(), tree.linksFor(GroupId(99u, 0u), except = linkA))
+        assertEquals(emptySet(), tree.linksFor(GroupId(99u), except = linkA))
     }
 
     @Test fun `linksFor returns empty set when only the except link is registered`() {
@@ -100,7 +100,7 @@ class MulticastTreeTest {
     }
 
     @Test fun `allLinksFor returns empty set for unknown group`() {
-        assertEquals(emptySet(), MulticastTree().allLinksFor(GroupId(99u, 0u)))
+        assertEquals(emptySet(), MulticastTree().allLinksFor(GroupId(99u)))
     }
 
     // ── re-registration refreshes lastSeen ────────────────────────────────────
@@ -116,7 +116,7 @@ class MulticastTreeTest {
 
     @Test fun `different groups have independent link sets`() {
         val tree = MulticastTree()
-        val gid2 = GroupId(owner = 2u, seq = 0u)
+        val gid2 = GroupId(2u)
         tree.registerUpstream(gid,  linkA)
         tree.registerUpstream(gid2, linkB)
         assertEquals(setOf(linkA), tree.allLinksFor(gid))

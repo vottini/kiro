@@ -43,22 +43,19 @@ private const val TYPE_MULTICAST = 3
  *                B5=[ttl[3:0]:4|spare:4]            B6=payloadLen(8)
  *                payload[0..n-1]
  *
- * BEACON    9    B0=[type:4|nextHop[11:8]:4]         B1=nextHop[7:0]
- *                B2=[srcId[11:8]:4|owner[11:8]:4]    B3=srcId[7:0]   B4=owner[7:0]
- *                B5=gseq[15:8]                        B6=gseq[7:0]
- *                B7=[activeRoot[11:8]:4|spare:4]      B8=activeRoot[7:0]
+ * BEACON    8    B0=[type:4|nextHop[11:8]:4]         B1=nextHop[7:0]
+ *                B2=[srcId[11:8]:4|gid[19:16]:4]     B3=srcId[7:0]
+ *                B4=gid[15:8]                         B5=gid[7:0]
+ *                B6=[activeRoot[11:8]:4|spare:4]      B7=activeRoot[7:0]
  *
- * MULTICAST 9+n  B0=[type:4|srcId[11:8]:4]           B1=srcId[7:0]
- *                B2=[owner[11:8]:4|ttl[3:0]:4]        B3=owner[7:0]
- *                B4=gseq[15:8]                        B5=gseq[7:0]
- *                B6=mcastSeq[15:8]                    B7=mcastSeq[7:0]
- *                B8=payloadLen(8)
+ * MULTICAST 8+n  B0=[type:4|srcId[11:8]:4]           B1=srcId[7:0]
+ *                B2=[gid[19:16]:4|ttl[3:0]:4]         B3=gid[15:8]
+ *                B4=gid[7:0]                           B5=mcastSeq[15:8]
+ *                B6=mcastSeq[7:0]                      B7=payloadLen(8)
  *                payload[0..n-1]
  * ```
  *
- * BEACON and MULTICAST encode the [GroupId] as its constituent owner (12-bit) and
- * group-sequence (16-bit) fields rather than the raw 32-bit UInt, because the
- * owner already fits in 12 bits — saving 4 bytes versus a flat 32-bit encoding.
+ * BEACON and MULTICAST encode [GroupId] as an opaque 20-bit value (bits [19:0] of [GroupId.id]).
  */
 fun encode(frame: Frame): ByteArray = when (frame) {
     is Frame.OgmFrame       -> encodeOgm(frame)
@@ -124,73 +121,67 @@ private fun encodeData(frame: Frame.DataFrame): ByteArray {
 }
 
 /**
- * BEACON: 9 bytes.
+ * BEACON: 8 bytes.
  *
- * GroupId is unpacked into owner (12-bit) and group-sequence (16-bit).
- * [Frame.BeaconFrame.activeRoot] occupies B7–B8: relay nodes stop forwarding
+ * GroupId is encoded as an opaque 20-bit value (gid.id and 0xFFFFF).
+ * [Frame.BeaconFrame.activeRoot] occupies B6–B7: relay nodes stop forwarding
  * when their own NodeId matches activeRoot, without needing local group state.
  *
  * B0: [type:4|nextHop[11:8]:4]
  * B1: nextHop[7:0]
- * B2: [srcId[11:8]:4|owner[11:8]:4]
+ * B2: [srcId[11:8]:4|gid[19:16]:4]
  * B3: srcId[7:0]
- * B4: owner[7:0]
- * B5: gseq[15:8]
- * B6: gseq[7:0]
- * B7: [activeRoot[11:8]:4|spare:4]
- * B8: activeRoot[7:0]
+ * B4: gid[15:8]
+ * B5: gid[7:0]
+ * B6: [activeRoot[11:8]:4|spare:4]
+ * B7: activeRoot[7:0]
  */
 private fun encodeBeacon(frame: Frame.BeaconFrame): ByteArray {
     val nextHop    = frame.nextHop.toInt()       and 0xFFF
     val srcId      = frame.srcId.toInt()         and 0xFFF
-    val owner      = frame.groupId.owner.toInt() and 0xFFF
-    val gseq       = frame.groupId.seq.toInt()   and 0xFFFF
+    val gid        = frame.groupId.id.toInt()    and 0xFFFFF
     val activeRoot = frame.activeRoot.toInt()     and 0xFFF
     return byteArrayOf(
         ((TYPE_BEACON shl 4) or (nextHop ushr 8)).toByte(),
         (nextHop and 0xFF).toByte(),
-        ((srcId ushr 8 shl 4) or (owner ushr 8)).toByte(),
+        ((srcId ushr 8 shl 4) or (gid ushr 16)).toByte(),
         (srcId and 0xFF).toByte(),
-        (owner and 0xFF).toByte(),
-        (gseq ushr 8).toByte(),
-        (gseq and 0xFF).toByte(),
+        ((gid ushr 8) and 0xFF).toByte(),
+        (gid and 0xFF).toByte(),
         ((activeRoot ushr 8) shl 4).toByte(),
         (activeRoot and 0xFF).toByte()
     )
 }
 
 /**
- * MULTICAST: 9 + payload bytes.
+ * MULTICAST: 8 + payload bytes.
  *
  * B0: [type:4|srcId[11:8]:4]
  * B1: srcId[7:0]
- * B2: [owner[11:8]:4|ttl[3:0]:4]
- * B3: owner[7:0]
- * B4: gseq[15:8]
- * B5: gseq[7:0]
- * B6: mcastSeq[15:8]
- * B7: mcastSeq[7:0]
- * B8: payloadLen (unsigned, 0–255)
- * B9…: payload
+ * B2: [gid[19:16]:4|ttl[3:0]:4]
+ * B3: gid[15:8]
+ * B4: gid[7:0]
+ * B5: mcastSeq[15:8]
+ * B6: mcastSeq[7:0]
+ * B7: payloadLen (unsigned, 0–255)
+ * B8…: payload
  */
 private fun encodeMulticast(frame: Frame.MulticastFrame): ByteArray {
     val srcId    = frame.srcId.toInt()           and 0xFFF
-    val owner    = frame.groupId.owner.toInt() and 0xFFF
-    val ttl      = frame.ttl.toInt()           and 0xF
-    val gseq     = frame.groupId.seq.toInt()   and 0xFFFF
+    val gid      = frame.groupId.id.toInt()      and 0xFFFFF
+    val ttl      = frame.ttl.toInt()             and 0xF
     val mcastSeq = frame.seqNum.toInt()          and 0xFFFF
     val payload  = frame.payload
-    return ByteArray(9 + payload.size).also { b ->
+    return ByteArray(8 + payload.size).also { b ->
         b[0] = ((TYPE_MULTICAST shl 4) or (srcId ushr 8)).toByte()
         b[1] = (srcId and 0xFF).toByte()
-        b[2] = ((owner ushr 8 shl 4) or ttl).toByte()
-        b[3] = (owner and 0xFF).toByte()
-        b[4] = (gseq ushr 8).toByte()
-        b[5] = (gseq and 0xFF).toByte()
-        b[6] = (mcastSeq ushr 8).toByte()
-        b[7] = (mcastSeq and 0xFF).toByte()
-        b[8] = payload.size.toByte()
-        payload.copyInto(b, destinationOffset = 9)
+        b[2] = ((gid ushr 16 shl 4) or ttl).toByte()
+        b[3] = ((gid ushr 8) and 0xFF).toByte()
+        b[4] = (gid and 0xFF).toByte()
+        b[5] = (mcastSeq ushr 8).toByte()
+        b[6] = (mcastSeq and 0xFF).toByte()
+        b[7] = payload.size.toByte()
+        payload.copyInto(b, destinationOffset = 8)
     }
 }
 
@@ -253,37 +244,36 @@ private fun decodeData(raw: ByteArray, b0: Int): Frame? {
 }
 
 private fun decodeBeacon(raw: ByteArray, b0: Int): Frame? {
-    if (raw.size < 9) return null
+    if (raw.size < 8) return null
     val nextHop    = ((b0 and 0xF) shl 8) or (raw[1].toInt() and 0xFF)
     val b2         = raw[2].toInt() and 0xFF
     val srcId      = ((b2 ushr 4) shl 8) or (raw[3].toInt() and 0xFF)
-    val owner      = ((b2 and 0xF) shl 8) or (raw[4].toInt() and 0xFF)
-    val gseq       = (((raw[5].toInt() and 0xFF) shl 8) or (raw[6].toInt() and 0xFF)).toUShort()
-    val activeRoot = (((raw[7].toInt() and 0xFF) ushr 4) shl 8) or (raw[8].toInt() and 0xFF)
+    val gidHi      = b2 and 0xF
+    val gid        = (gidHi shl 16) or ((raw[4].toInt() and 0xFF) shl 8) or (raw[5].toInt() and 0xFF)
+    val activeRoot = (((raw[6].toInt() and 0xFF) ushr 4) shl 8) or (raw[7].toInt() and 0xFF)
     return Frame.BeaconFrame(
         nextHop    = nextHop.toUShort(),
         srcId      = srcId.toUShort(),
-        groupId    = GroupId(owner.toUShort(), gseq),
+        groupId    = GroupId(gid.toUInt()),
         activeRoot = activeRoot.toUShort()
     )
 }
 
 private fun decodeMulticast(raw: ByteArray, b0: Int): Frame? {
-    if (raw.size < 9) return null
+    if (raw.size < 8) return null
     val srcId      = ((b0 and 0xF) shl 8) or (raw[1].toInt() and 0xFF)
     val b2         = raw[2].toInt() and 0xFF
-    val owner      = ((b2 ushr 4) shl 8) or (raw[3].toInt() and 0xFF)
+    val gidHi      = b2 ushr 4
     val ttl        = (b2 and 0xF).toUByte()
-    val gseq       = (((raw[4].toInt() and 0xFF) shl 8) or (raw[5].toInt() and 0xFF)).toUShort()
-    val mcastSeq   = (((raw[6].toInt() and 0xFF) shl 8) or (raw[7].toInt() and 0xFF)).toUShort()
-    val payloadLen = raw[8].toInt() and 0xFF
-    if (raw.size < 9 + payloadLen) return null
+    val gid        = (gidHi shl 16) or ((raw[3].toInt() and 0xFF) shl 8) or (raw[4].toInt() and 0xFF)
+    val mcastSeq   = (((raw[5].toInt() and 0xFF) shl 8) or (raw[6].toInt() and 0xFF)).toUShort()
+    val payloadLen = raw[7].toInt() and 0xFF
+    if (raw.size < 8 + payloadLen) return null
     return Frame.MulticastFrame(
         srcId   = srcId.toUShort(),
-        groupId = GroupId(owner.toUShort(), gseq),
+        groupId = GroupId(gid.toUInt()),
         seqNum  = mcastSeq,
         ttl     = ttl,
-        payload = raw.copyOfRange(9, 9 + payloadLen)
+        payload = raw.copyOfRange(8, 8 + payloadLen)
     )
 }
-

@@ -11,16 +11,16 @@ import kotlin.time.toJavaDuration
  *
  * ## How the tree is built
  *
- * Each group member periodically sends a [Frame.BeaconFrame] toward the group owner
+ * Each group member periodically sends a [Frame.BeaconFrame] toward the group root
  * via unicast routing. Every node that relays this beacon is on the path between
- * that member and the owner. The relay node calls [registerLink] for both the
+ * that member and the root. The relay node calls [registerLink] for both the
  * incoming link (where the beacon arrived) and the outgoing link (where it is
- * forwarded). This progressively builds a spanning tree rooted at the owner:
+ * forwarded). This progressively builds a spanning tree rooted at the root:
  *
- *   Owner
+ *   Root
  *   ├── Link A  (registered when M1's beacon arrived from M1 direction)
  *   └── Link B  (registered when M2's beacon arrived from M2 direction)
- *       └── Link C  (registered by an intermediate node between M2 and the owner)
+ *       └── Link C  (registered by an intermediate node between M2 and the root)
  *
  * ## How the tree is used
  *

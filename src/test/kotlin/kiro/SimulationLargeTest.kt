@@ -66,8 +66,8 @@ class SimulationLargeTest {
     private suspend fun KiroRouter.sendTo(dst: Int, text: String) =
         send(dst.toUShort(), text.encodeToByteArray())
 
-    private fun joinAs(gid: GroupId, dst: Int) =
-        nodeById[dst]!!.joinGroup(gid)
+    private fun joinAs(gid: GroupId, dst: Int, roots: List<NodeId> = emptyList()) =
+        nodeById[dst]!!.joinGroup(gid, roots)
 
     /**
      * Listens on [rx].incomingData, then sends [text] to [dst] every 1.5 s until received.
@@ -149,8 +149,10 @@ class SimulationLargeTest {
 
         // ── Multicast: D1(3) owns, one access node per distribution group ──
         delay(OGM_LARGE)   // let routes via C2 fully stabilize before issuing invites
-        val gid = dist[0].createGroup()
-        for (i in 0 until 8) joinAs(gid, 11 + i * 4)  // A1, A5, A9, A13...
+        val gid = GroupId(10u)
+        val creatorSelfId10 = dist[0].selfId
+        dist[0].joinGroup(gid, roots = listOf(creatorSelfId10))
+        for (i in 0 until 8) joinAs(gid, 11 + i * 4, roots = listOf(creatorSelfId10))  // A1, A5, A9, A13...
         delay(TREE_BUILD)
 
         val defs = Array(8) { CompletableDeferred<MulticastMessage>() }
@@ -217,8 +219,11 @@ class SimulationLargeTest {
         assertUnicast(nodes[20], nodes[0], 21, "post-kill", "1→21 after kills")
 
         // ── Multicast: node 1 owns, nodes 21 and 31 join (node 11 dead, skip) ──
-        val gid = nodes[0].createGroup()
-        joinAs(gid, 21); joinAs(gid, 31)
+        val gid = GroupId(11u)
+        val creatorSelfId11 = nodes[0].selfId
+        nodes[0].joinGroup(gid, roots = listOf(creatorSelfId11))
+        joinAs(gid, 21, roots = listOf(creatorSelfId11))
+        joinAs(gid, 31, roots = listOf(creatorSelfId11))
         delay(TREE_BUILD)
 
         val got21 = CompletableDeferred<MulticastMessage>()
@@ -307,8 +312,10 @@ class SimulationLargeTest {
         // Leaves 1,5,9 connect to dead spine[1] and alive spine[2]; their invite path is 6 hops
         // via spine[3]. Wait for those alternative routes to fully converge before inviting.
         delay(OGM_LARGE)
-        val gid = spines[0].createGroup()
-        for (l in 0 until LEAVES) joinAs(gid, SPINES + LEAVES + l * HOSTS_PER_LEAF + 1)
+        val gid = GroupId(12u)
+        val creatorSelfId12 = spines[0].selfId
+        spines[0].joinGroup(gid, roots = listOf(creatorSelfId12))
+        for (l in 0 until LEAVES) joinAs(gid, SPINES + LEAVES + l * HOSTS_PER_LEAF + 1, roots = listOf(creatorSelfId12))
         delay(TREE_BUILD)
         delay(TREE_BUILD)
         delay(TREE_BUILD)  // 3× TREE_BUILD: under full-suite load actual beacon interval is 3-4× slower
@@ -387,8 +394,10 @@ class SimulationLargeTest {
         assertUnicast(leaves[7][3], leaves[0][0], 41, "post", "L1→L32 after hub dies")
 
         // ── Multicast from S1(2), one leaf per secondary group ──
-        val gid = secs[0].createGroup()
-        for (i in 0 until SECS) joinAs(gid, 10 + i * LEAVES_PER)
+        val gid = GroupId(13u)
+        val creatorSelfId13 = secs[0].selfId
+        secs[0].joinGroup(gid, roots = listOf(creatorSelfId13))
+        for (i in 0 until SECS) joinAs(gid, 10 + i * LEAVES_PER, roots = listOf(creatorSelfId13))
         delay(TREE_BUILD)
 
         val mDefs = Array(SECS) { CompletableDeferred<MulticastMessage>() }
@@ -628,9 +637,9 @@ class SimulationLargeTest {
     // S17: Three concurrent multicast groups under relay failure (40 nodes)
     //
     //   5×8 grid. Three multicast groups run simultaneously:
-    //     G1: owner node 1  (top-left),  members {8, 33, 40}
-    //     G2: owner node 20 (centre),    members {1, 21, 40}
-    //     G3: owner node 40 (bot-right), members {1, 8, 20}
+    //     G1: root node 1  (top-left),  members {8, 33, 40}
+    //     G2: root node 20 (centre),    members {1, 21, 40}
+    //     G3: root node 40 (bot-right), members {1, 8, 20}
     //
     //   A central relay node (21) is killed mid-operation to stress the
     //   multicast trees. Each group must independently heal via alternatives.
@@ -664,12 +673,18 @@ class SimulationLargeTest {
         grid.forEach { row -> row.forEach { nd -> if (nd !== n(21)) nd.start(this) } }
         delay(OGM_LARGE)
 
-        val g1 = n(1).createGroup();  joinAs(g1, 8);  joinAs(g1, 33); joinAs(g1, 40)
-        val g2 = n(20).createGroup(); joinAs(g2, 1); joinAs(g2, 21); joinAs(g2, 40)
-        val g3 = n(40).createGroup(); joinAs(g3, 1); joinAs(g3, 8);  joinAs(g3, 20)
+        val g1 = GroupId(171u); val g1Root = n(1).selfId
+        n(1).joinGroup(g1, roots = listOf(g1Root))
+        joinAs(g1, 8, roots = listOf(g1Root)); joinAs(g1, 33, roots = listOf(g1Root)); joinAs(g1, 40, roots = listOf(g1Root))
+        val g2 = GroupId(172u); val g2Root = n(20).selfId
+        n(20).joinGroup(g2, roots = listOf(g2Root))
+        joinAs(g2, 1, roots = listOf(g2Root)); joinAs(g2, 21, roots = listOf(g2Root)); joinAs(g2, 40, roots = listOf(g2Root))
+        val g3 = GroupId(173u); val g3Root = n(40).selfId
+        n(40).joinGroup(g3, roots = listOf(g3Root))
+        joinAs(g3, 1, roots = listOf(g3Root)); joinAs(g3, 8, roots = listOf(g3Root));  joinAs(g3, 20, roots = listOf(g3Root))
         delay(TREE_BUILD)
 
-        fun sendGroup(owner: KiroRouter, gid: GroupId, label: String,
+        fun sendGroup(root: KiroRouter, gid: GroupId, label: String,
                       members: List<Int>): List<CompletableDeferred<MulticastMessage>> {
             val defs = members.map { CompletableDeferred<MulticastMessage>() }
             members.zip(defs).forEach { (id, def) ->
@@ -855,8 +870,10 @@ class SimulationLargeTest {
         assertUnicast(leafOfB6, leafOfB3, leafOfB6.selfId.toInt(), "post", "B3leaf→B6leaf after kills")
 
         // ── Multicast: inner[0](9) owns, first leaf of each inner node joins ──
-        val gid = inner[0].createGroup()
-        for (i in 0 until RING) joinAs(gid, RING * 2 + i * LEAVES_PER + 1)
+        val gid = GroupId(19u)
+        val creatorSelfId19 = inner[0].selfId
+        inner[0].joinGroup(gid, roots = listOf(creatorSelfId19))
+        for (i in 0 until RING) joinAs(gid, RING * 2 + i * LEAVES_PER + 1, roots = listOf(creatorSelfId19))
         delay(TREE_BUILD)
 
         val mDefs = Array(RING) { CompletableDeferred<MulticastMessage>() }
@@ -940,9 +957,11 @@ class SimulationLargeTest {
         // Build two multicast groups.
         // G1 members chosen on BB1, BB2, BB8, BB9 — the only surviving backbone nodes after
         // killing BB3, BB5, BB7 (which also isolates BB4 and BB6 from the ring).
-        val g1 = bb(1).createGroup()
-        listOf(1, 5, 29, 33).forEach { ac -> joinAs(g1, BB + ac) }
-        // G2 owner BB5 will be killed in sequential step 2 — skip G2 entirely.
+        val g1 = GroupId(20u)
+        val g1Root = bb(1).selfId
+        bb(1).joinGroup(g1, roots = listOf(g1Root))
+        listOf(1, 5, 29, 33).forEach { ac -> joinAs(g1, BB + ac, roots = listOf(g1Root)) }
+        // G2 root BB5 will be killed in sequential step 2 — skip G2 entirely.
         delay(TREE_BUILD)
 
         // ── Sequential kills with unicast test after each ──

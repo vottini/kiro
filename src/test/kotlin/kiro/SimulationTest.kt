@@ -134,8 +134,9 @@ class SimulationTest {
         assertEquals("hello A", u2.awaitOrFail(message = "unicast C→A").second.decodeToString())
 
         // ── Multicast: A owns, C joins; B relays without being a member ──
-        val gid = a.createGroup()
-        nodeById[3]!!.joinGroup(gid)
+        val gid = GroupId(1u)
+        a.joinGroup(gid, roots = listOf(a.selfId))
+        nodeById[3]!!.joinGroup(gid, roots = listOf(a.selfId))
         delay(TREE_BUILD)   // C beacons: C→B→A; tree built on B and A
 
         val m1rcv = subscribeAndTrigger(c.incomingMulticast, { it.groupId == gid }) {
@@ -182,8 +183,10 @@ class SimulationTest {
         assertEquals("F→C", uFC.awaitOrFail(message = "unicast F→C").second.decodeToString())
 
         // ── Multicast: A owns, E and F join ──
-        val gid = a.createGroup()
-        nodeById[5]!!.joinGroup(gid); nodeById[6]!!.joinGroup(gid)
+        val gid = GroupId(2u)
+        a.joinGroup(gid, roots = listOf(a.selfId))
+        nodeById[5]!!.joinGroup(gid, roots = listOf(a.selfId))
+        nodeById[6]!!.joinGroup(gid, roots = listOf(a.selfId))
         delay(TREE_BUILD)   // 3-hop beacons E/F→D→B→A build the tree
 
         // Subscribe both receivers before sending, with a single SUB_DELAY shared.
@@ -246,8 +249,10 @@ class SimulationTest {
         assertEquals("to B", uRB.awaitOrFail(message = "unicast R→B").second.decodeToString())
 
         // ── Multicast: R owns, B and C join ──
-        val gid = r.createGroup()
-        nodeById[3]!!.joinGroup(gid); nodeById[4]!!.joinGroup(gid)
+        val gid = GroupId(3u)
+        r.joinGroup(gid, roots = listOf(r.selfId))
+        nodeById[3]!!.joinGroup(gid, roots = listOf(r.selfId))
+        nodeById[4]!!.joinGroup(gid, roots = listOf(r.selfId))
         delay(TREE_BUILD)   // C beacons C→A→R; B beacons B→R; tree fully built
 
         val gotB = CompletableDeferred<MulticastMessage>()
@@ -303,8 +308,10 @@ class SimulationTest {
         // Node 4 beacons: 4→3→2→1 (clockwise arc).
         // Node 7 beacons: 7→8→9→10→1 (counter-clockwise arc).
         // Tree at node 1 has branches in both directions.
-        val gid = nodes[0].createGroup()
-        nodeById[4]!!.joinGroup(gid); nodeById[7]!!.joinGroup(gid)
+        val gid = GroupId(4u)
+        nodes[0].joinGroup(gid, roots = listOf(nodes[0].selfId))
+        nodeById[4]!!.joinGroup(gid, roots = listOf(nodes[0].selfId))
+        nodeById[7]!!.joinGroup(gid, roots = listOf(nodes[0].selfId))
         delay(TREE_BUILD)
 
         val got4 = CompletableDeferred<MulticastMessage>()
@@ -379,8 +386,12 @@ class SimulationTest {
         assertEquals("8→15", u815.awaitOrFail(message = "unicast 8→15").second.decodeToString())
 
         // ── Multicast: root owns, one leaf per depth-2 subtree joins ──
-        val gid = n1.createGroup()
-        nodeById[8]!!.joinGroup(gid); nodeById[10]!!.joinGroup(gid); nodeById[12]!!.joinGroup(gid); nodeById[14]!!.joinGroup(gid)
+        val gid = GroupId(5u)
+        n1.joinGroup(gid, roots = listOf(n1.selfId))
+        nodeById[8]!!.joinGroup(gid, roots = listOf(n1.selfId))
+        nodeById[10]!!.joinGroup(gid, roots = listOf(n1.selfId))
+        nodeById[12]!!.joinGroup(gid, roots = listOf(n1.selfId))
+        nodeById[14]!!.joinGroup(gid, roots = listOf(n1.selfId))
         delay(TREE_BUILD)
 
         val got8  = CompletableDeferred<MulticastMessage>()
@@ -456,8 +467,12 @@ class SimulationTest {
         assertEquals("4→13", u4_13.awaitOrFail(message = "unicast 4→13").second.decodeToString())
 
         // ── Multicast: node 6 owns, four corners join ──
-        val gid = n(6).createGroup()
-        nodeById[1]!!.joinGroup(gid); nodeById[4]!!.joinGroup(gid); nodeById[13]!!.joinGroup(gid); nodeById[16]!!.joinGroup(gid)
+        val gid = GroupId(6u)
+        n(6).joinGroup(gid, roots = listOf(n(6).selfId))
+        nodeById[1]!!.joinGroup(gid, roots = listOf(n(6).selfId))
+        nodeById[4]!!.joinGroup(gid, roots = listOf(n(6).selfId))
+        nodeById[13]!!.joinGroup(gid, roots = listOf(n(6).selfId))
+        nodeById[16]!!.joinGroup(gid, roots = listOf(n(6).selfId))
         delay(TREE_BUILD)
 
         val corners = mapOf(1 to CompletableDeferred(), 4 to CompletableDeferred<MulticastMessage>(),
@@ -601,8 +616,9 @@ class SimulationTest {
         listOf(s, r2, m).forEach { it.start(this) }
         delay(OGM_CONV)
 
-        val gid = s.createGroup()
-        nodeById[4]!!.joinGroup(gid)
+        val gid = GroupId(9u)
+        s.joinGroup(gid, roots = listOf(s.selfId))
+        nodeById[4]!!.joinGroup(gid, roots = listOf(s.selfId))
         delay(TREE_BUILD)   // M's beacons build S's tree via R1 or R2
 
         // ── Baseline: multicast S→M works ──
