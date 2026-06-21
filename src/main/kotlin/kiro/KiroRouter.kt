@@ -16,7 +16,7 @@ import kotlin.time.Duration.Companion.seconds
 const val MAX_TTL: UByte = 15u
 
 /**
- * Payload delivered to [BatmanRouter.incomingMulticast] collectors when a
+ * Payload delivered to [KiroRouter.incomingMulticast] collectors when a
  * [Frame.MulticastFrame] is received and this node is a member of the target group.
  */
 data class MulticastMessage(val srcId: NodeId, val groupId: GroupId, val payload: ByteArray)
@@ -73,7 +73,7 @@ data class MulticastMessage(val srcId: NodeId, val groupId: GroupId, val payload
  *   [neighborPurgeMultiplier] × [Link.ogmInterval] is presumed gone. Default 3 matches
  *   batman-adv's own originator timeout heuristic.
  */
-class BatmanRouter(
+class KiroRouter(
     val selfId: NodeId,
     val links: List<Link>,
     val txQueue: TxQueue = TxQueue(),

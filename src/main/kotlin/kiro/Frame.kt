@@ -28,7 +28,7 @@ data class Ogm(
  * Discriminated union of all frame types carried over the mesh.
  *
  * All frames share a single byte type tag in the wire format (see [Codec]).
- * The [BatmanRouter] dispatches received frames based on their runtime type.
+ * The [KiroRouter] dispatches received frames based on their runtime type.
  */
 sealed class Frame {
 
@@ -63,7 +63,7 @@ sealed class Frame {
     /**
      * Sent by the group owner to invite a specific node into a multicast group.
      * Routed as a unicast frame through the mesh; each relay node updates [nextHop]
-     * to the next step toward [dstId]. Upon receipt, the destination calls [BatmanRouter.joinGroup]
+     * to the next step toward [dstId]. Upon receipt, the destination calls [KiroRouter.joinGroup]
      * and begins sending [BeaconFrame]s to build its branch of the multicast tree.
      *
      * @property nextHop Link-layer next hop, updated at each relay.
@@ -73,7 +73,7 @@ sealed class Frame {
      * @property deputies Ordered list of fallback tree roots. If the primary owner
      *   becomes unreachable, members try each deputy in order — the first one with
      *   a known route becomes the new [BeaconFrame.activeRoot]. Stored by the
-     *   invitee in [BatmanRouter.groupDeputies] for use by [BatmanRouter.beaconLoop].
+     *   invitee in [KiroRouter.groupDeputies] for use by [KiroRouter.beaconLoop].
      */
     data class InviteFrame(
         val nextHop: NodeId,

@@ -38,10 +38,10 @@ class SimulationLargeTest {
     private fun lnk(id: String, med: SimMedium) = simLink(id, med, OGM_INTERVAL)
 
     private fun node(id: Int, vararg links: Link) =
-        BatmanRouter(selfId = id.toUShort(), links = links.toList(),
+        KiroRouter(selfId = id.toUShort(), links = links.toList(),
             staleThreshold = STALE, neighborPurgeMultiplier = PURGE_MULT)
 
-    private fun CoroutineScope.startKillable(n: BatmanRouter): CompletableJob {
+    private fun CoroutineScope.startKillable(n: KiroRouter): CompletableJob {
         val job = SupervisorJob(coroutineContext[Job])
         n.start(CoroutineScope(coroutineContext + job))
         return job
@@ -61,10 +61,10 @@ class SimulationLargeTest {
         timeout: Duration = 6.seconds, msg: String = "not received"
     ): T = withTimeoutOrNull(timeout) { await() } ?: error("$msg within $timeout")
 
-    private suspend fun BatmanRouter.sendTo(dst: Int, text: String) =
+    private suspend fun KiroRouter.sendTo(dst: Int, text: String) =
         send(dst.toUShort(), text.encodeToByteArray())
 
-    private suspend fun BatmanRouter.inviteTo(gid: GroupId, dst: Int) =
+    private suspend fun KiroRouter.inviteTo(gid: GroupId, dst: Int) =
         invite(gid, dst.toUShort())
 
     /**
@@ -76,7 +76,7 @@ class SimulationLargeTest {
      * counts or post-kill re-convergence may need a longer window.
      */
     private suspend fun CoroutineScope.assertUnicast(
-        rx: BatmanRouter, tx: BatmanRouter, dst: Int, text: String, errMsg: String,
+        rx: KiroRouter, tx: KiroRouter, dst: Int, text: String, errMsg: String,
         timeout: Duration = 6.seconds
     ) {
         val d = CompletableDeferred<Unit>()
@@ -438,7 +438,7 @@ class SimulationLargeTest {
         val bridge2Med_B = SimMedium() // B2 ↔ B[3][4]
 
         fun buildGrid(grid: Int, hMed: Array<Array<SimMedium>>, vMed: Array<Array<SimMedium>>,
-                      extraLinks: (r: Int, c: Int) -> List<Link>): Array<Array<BatmanRouter>> =
+                      extraLinks: (r: Int, c: Int) -> List<Link>): Array<Array<KiroRouter>> =
             Array(R) { r ->
                 Array(C) { c ->
                     val links = mutableListOf<Link>()
@@ -667,7 +667,7 @@ class SimulationLargeTest {
         val g3 = n(40).createGroup(); n(40).inviteTo(g3, 1); n(40).inviteTo(g3, 8);  n(40).inviteTo(g3, 20)
         delay(TREE_BUILD)
 
-        fun sendGroup(owner: BatmanRouter, gid: GroupId, label: String,
+        fun sendGroup(owner: KiroRouter, gid: GroupId, label: String,
                       members: List<Int>): List<CompletableDeferred<MulticastMessage>> {
             val defs = members.map { CompletableDeferred<MulticastMessage>() }
             members.zip(defs).forEach { (id, def) ->
@@ -826,7 +826,7 @@ class SimulationLargeTest {
                 lnk("I${i+1}-X",   crossLinks[i]),
                 *Array(LEAVES_PER) { j -> lnk("I${i+1}-L${j+1}", leafMed[i][j]) })
         }
-        val leaves: Array<Array<BatmanRouter>> = Array(RING) { i ->
+        val leaves: Array<Array<KiroRouter>> = Array(RING) { i ->
             Array(LEAVES_PER) { j ->
                 node(RING * 2 + i * LEAVES_PER + j + 1, lnk("L${i*LEAVES_PER+j+1}-I", leafMed[i][j]))
             }

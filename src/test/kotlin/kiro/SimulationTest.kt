@@ -47,7 +47,7 @@ fun simLink(id: String, medium: SimMedium, interval: Duration = 50.milliseconds)
  *                         on the hot SharedFlow before the trigger fires.
  *
  * Hot-flow subscriber race:
- *   [BatmanRouter.incomingMulticast] and [BatmanRouter.incomingData] are
+ *   [KiroRouter.incomingMulticast] and [KiroRouter.incomingData] are
  *   zero-buffer SharedFlows; an emission with no active subscriber is dropped.
  *   On [Dispatchers.Default] (multi-threaded), [Flow.onSubscription] does not
  *   reliably solve this because the action may fire on a second thread before
@@ -68,14 +68,14 @@ class SimulationTest {
     private val SUB_DELAY  = 100.milliseconds
 
     private fun node(id: UShort, vararg links: Link) =
-        BatmanRouter(selfId = id.toUShort(), links = links.toList(), staleThreshold = STALE,
+        KiroRouter(selfId = id.toUShort(), links = links.toList(), staleThreshold = STALE,
             neighborPurgeMultiplier = 5)
 
     /**
      * Starts [node] under a child [SupervisorJob] so it can be killed independently
      * by cancelling the returned job without tearing down the whole test scope.
      */
-    private fun CoroutineScope.startKillable(node: BatmanRouter): CompletableJob {
+    private fun CoroutineScope.startKillable(node: KiroRouter): CompletableJob {
         val job = SupervisorJob(coroutineContext[Job])
         node.start(CoroutineScope(coroutineContext + job))
         return job

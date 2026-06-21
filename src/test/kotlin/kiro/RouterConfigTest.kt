@@ -25,14 +25,16 @@ class RouterConfigTest {
     }
 
     @Test fun `5 kbps 40 nodes yields ~770 ms interval and purge mult 5`() {
-        val cfg = recommendedConfig(5_000L, expectedNodes = 40)
+        // Formula gives 0.768 s; pass explicit floor below that to observe the raw result.
+        val cfg = recommendedConfig(5_000L, expectedNodes = 40, minOgmInterval = 100.milliseconds)
         // 40×48 / (0.5×5000) = 0.768 s
         assertTrue(cfg.ogmInterval in 760.milliseconds..780.milliseconds, "ogmInterval=${cfg.ogmInterval}")
         assertEquals(5, cfg.neighborPurgeMultiplier)
     }
 
     @Test fun `50 kbps 40 nodes yields ~77 ms interval and purge mult 5`() {
-        val cfg = recommendedConfig(50_000L, expectedNodes = 40)
+        // Formula gives 0.0768 s; pass explicit floor below that to observe the raw result.
+        val cfg = recommendedConfig(50_000L, expectedNodes = 40, minOgmInterval = 10.milliseconds)
         // 40×48 / (0.5×50000) = 0.0768 s
         assertTrue(cfg.ogmInterval in 76.milliseconds..78.milliseconds, "ogmInterval=${cfg.ogmInterval}")
         assertEquals(5, cfg.neighborPurgeMultiplier)
@@ -41,8 +43,10 @@ class RouterConfigTest {
     // ── expectedNodes scales the interval linearly ────────────────────────────
 
     @Test fun `interval scales linearly with node count`() {
-        val cfg10 = recommendedConfig(1_000L, expectedNodes = 10)
-        val cfg20 = recommendedConfig(1_000L, expectedNodes = 20)
+        // Use a bandwidth where formula results (0.48 s and 0.96 s) stay below the 5 s floor,
+        // so pass a smaller explicit floor to observe the unclipped scaling.
+        val cfg10 = recommendedConfig(1_000L, expectedNodes = 10, minOgmInterval = 100.milliseconds)
+        val cfg20 = recommendedConfig(1_000L, expectedNodes = 20, minOgmInterval = 100.milliseconds)
         // doubling nodes doubles the interval
         val ratio = cfg20.ogmInterval.inWholeMilliseconds.toDouble() /
                     cfg10.ogmInterval.inWholeMilliseconds.toDouble()
@@ -52,16 +56,22 @@ class RouterConfigTest {
     // ── dataFraction shifts the budget ────────────────────────────────────────
 
     @Test fun `tighter data fraction produces longer interval`() {
-        val cfg50 = recommendedConfig(1_000L, expectedNodes = 10, dataFraction = 0.5)
-        val cfg80 = recommendedConfig(1_000L, expectedNodes = 10, dataFraction = 0.8)
+        // Pass a floor below both formula results (0.96 s and 2.4 s) to observe the effect.
+        val cfg50 = recommendedConfig(1_000L, expectedNodes = 10, dataFraction = 0.5, minOgmInterval = 100.milliseconds)
+        val cfg80 = recommendedConfig(1_000L, expectedNodes = 10, dataFraction = 0.8, minOgmInterval = 100.milliseconds)
         assertTrue(cfg80.ogmInterval > cfg50.ogmInterval,
             "80% data fraction should require longer interval than 50%")
     }
 
-    // ── floor at 50 ms for very fast links ────────────────────────────────────
+    // ── floor clamps very fast links ─────────────────────────────────────────
 
-    @Test fun `very high bandwidth is floored at 50 ms`() {
+    @Test fun `very high bandwidth is floored at default 5 s`() {
         val cfg = recommendedConfig(1_000_000_000L, expectedNodes = 10)
+        assertEquals(5.seconds, cfg.ogmInterval)
+    }
+
+    @Test fun `custom minOgmInterval is respected`() {
+        val cfg = recommendedConfig(1_000_000_000L, expectedNodes = 10, minOgmInterval = 50.milliseconds)
         assertEquals(50.milliseconds, cfg.ogmInterval)
     }
 

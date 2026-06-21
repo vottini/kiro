@@ -109,7 +109,7 @@ class MulticastTree {
      * Returns `true` if there is at least one downstream link for [groupId] whose
      * [LinkEntry.lastSeen] is no older than [within].
      *
-     * Used by [BatmanRouter.beaconLoop] to decide whether this node can suppress
+     * Used by [KiroRouter.beaconLoop] to decide whether this node can suppress
      * its own beacon: if a downstream member is actively sending beacons through
      * this node, its relayed beacons are already keeping the upstream path alive.
      */

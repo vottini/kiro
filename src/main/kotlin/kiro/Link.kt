@@ -45,7 +45,7 @@ interface Link {
 
     /**
      * Cold flow of raw frames received on this link.
-     * Each collector (one per link, started by [BatmanRouter]) receives every
+     * Each collector (one per link, started by [KiroRouter]) receives every
      * frame that arrives on the medium, regardless of intended recipient —
      * the router inspects the nextHop field to decide whether to process or drop.
      */

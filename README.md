@@ -45,7 +45,7 @@ val radio: Link = object : Link {
 }
 
 // 2. Create a router and start it inside a CoroutineScope.
-val router = BatmanRouter(selfId = 0x001u, links = listOf(radio))
+val router = KiroRouter(selfId = 0x001u, links = listOf(radio))
 router.start(scope)
 
 // 3. Send unicast data to another node.
@@ -80,12 +80,12 @@ interface Link {
 
 `ogmInterval` doubles as a routing metric: a link with a longer interval accumulates more TTL decay over multiple hops, so the protocol naturally prefers faster links when an alternative exists.
 
-### BatmanRouter
+### KiroRouter
 
 One instance per node. Orchestrates OGM emission, relay suppression, route table maintenance, multicast tree building, and frame forwarding.
 
 ```kotlin
-BatmanRouter(
+KiroRouter(
     selfId: NodeId,
     links: List<Link>,
     txQueue: TxQueue = TxQueue(),
@@ -218,15 +218,15 @@ val cfg = recommendedConfig(
 // cfg.purgeTimeout          ≈ 385 ms (= interval × multiplier)
 ```
 
-The formula: `ogmInterval = N × 48 bits / ((1 − dataFraction) × linkBandwidthBps)`, floored at 50 ms. The purge multiplier is chosen so `purgeTimeout ≈ 60 s` across all link speeds, clamped to [3, 5].
+The formula: `ogmInterval = N × 48 bits / ((1 − dataFraction) × linkBandwidthBps)`, floored at `minOgmInterval` (default 5 s). The purge multiplier is chosen so `purgeTimeout ≈ 60 s` across all link speeds, clamped to [3, 5].
 
 | Link speed | Nodes | ogmInterval | purgeMultiplier |
 |---|---|---|---|
 | 50 bps | 40 | ~77 s | 3 |
 | 500 bps | 40 | ~7.7 s | 5 |
-| 5 kbps | 40 | ~770 ms | 5 |
-| 50 kbps | 40 | ~77 ms | 5 |
-| ≥ 1 Gbps | any | 50 ms (floor) | 5 |
+| 5 kbps | 40 | ~5 s (floor) | 5 |
+| 50 kbps | 40 | ~5 s (floor) | 5 |
+| ≥ 1 Gbps | any | 5 s (floor) | 5 |
 
 ---
 
