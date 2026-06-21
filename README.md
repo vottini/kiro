@@ -231,9 +231,11 @@ All frames are bit-packed big-endian. Byte 0 always carries the 4-bit type tag i
 | Frame | Size | Notes |
 |---|---|---|
 | `OgmFrame` | 6 bytes | originatorId(12b) + senderId(12b) + ttl(4b) + seqNum(16b) |
-| `DataFrame` | 7 + n bytes | nextHop(12b) + src(12b) + dst(12b) + ttl(4b) + len(8b) + payload |
+| `DataFrame` | 7 + n bytes | nextHop(12b) + src(12b) + dst(12b) + ttl(4b) + varint(len) + payload |
 | `BeaconFrame` | 8 bytes | nextHop(12b) + src(12b) + groupId(20b) + activeRoot(12b) |
-| `MulticastFrame` | 8 + n bytes | src(12b) + groupId(20b) + ttl(4b) + seqNum(16b) + len(8b) + payload |
+| `MulticastFrame` | 8 + n bytes | src(12b) + groupId(20b) + ttl(4b) + seqNum(16b) + varint(len) + payload |
+
+Payload lengths use a 7-bit continuation varint: lengths ≤127 cost 1 byte, ≤16383 cost 2 bytes, ≤2097151 cost 3 bytes. No upper limit is imposed at the codec layer.
 
 `Codec.encode` and `Codec.decode` handle serialisation. `decode` returns `null` for malformed or unknown frames; the router silently drops them.
 

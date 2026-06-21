@@ -91,8 +91,8 @@ class CodecTest {
             assertArrayEquals(byteArrayOf(), decoded.payload)
         }
 
-        @Test fun `round-trip max payload size (255 bytes)`() {
-            val payload = ByteArray(255) { it.toByte() }
+        @Test fun `round-trip large payload beyond 255 bytes`() {
+            val payload = ByteArray(1000) { it.toByte() }
             val f = data(payload = payload)
             val decoded = roundTrip(f) as Frame.DataFrame
             assertArrayEquals(payload, decoded.payload)
@@ -107,9 +107,16 @@ class CodecTest {
             assertEquals(f.ttl,     decoded.ttl)
         }
 
-        @Test fun `encoded length is 7 + payload bytes`() {
+        @Test fun `encoded length is 7 + payload bytes for small payload`() {
+            // 10-byte payload: 6 header + 1 varint byte + 10 payload = 17
             val payload = ByteArray(10)
             assertEquals(17, encode(data(payload = payload)).size)
+        }
+
+        @Test fun `encoded length uses 2-byte varint for payload over 127 bytes`() {
+            // 128-byte payload: 6 header + 2 varint bytes + 128 payload = 136
+            val payload = ByteArray(128)
+            assertEquals(136, encode(data(payload = payload)).size)
         }
 
         @Test fun `type nibble is TYPE_DATA (1)`() {
@@ -123,7 +130,7 @@ class CodecTest {
 
         @Test fun `declared payload overrun decodes to null`() {
             val raw = encode(data(payload = ByteArray(5)))
-            // Lie about payload length: set payloadLen byte to 100
+            // Corrupt the varint length byte (byte 6) to claim 100 bytes
             raw[6] = 100
             assertNull(decode(raw))
         }
@@ -190,7 +197,7 @@ class CodecTest {
                 gid = GroupId(0xFFFFFu),
                 seq = 0xFFFFu,
                 ttl = 15u,
-                payload = ByteArray(255) { 0xFF.toByte() }
+                payload = ByteArray(1000) { 0xFF.toByte() }
             )
             val decoded = roundTrip(f) as Frame.MulticastFrame
             assertEquals(f.srcId,   decoded.srcId)
@@ -200,8 +207,14 @@ class CodecTest {
             assertArrayEquals(f.payload, decoded.payload)
         }
 
-        @Test fun `encoded length is 8 + payload bytes`() {
+        @Test fun `encoded length is 8 + payload bytes for small payload`() {
+            // 2-byte payload: 7 header + 1 varint byte + 2 payload = 10
             assertEquals(10, encode(multicast(payload = ByteArray(2))).size)
+        }
+
+        @Test fun `encoded length uses 2-byte varint for payload over 127 bytes`() {
+            // 128-byte payload: 7 header + 2 varint bytes + 128 payload = 137
+            assertEquals(137, encode(multicast(payload = ByteArray(128))).size)
         }
 
         @Test fun `type nibble is TYPE_MULTICAST (3)`() {

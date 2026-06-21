@@ -40,7 +40,7 @@ private const val TYPE_MULTICAST = 3
  *
  * DATA      7+n  B0=[type:4|nextHop[11:8]:4]       B1=nextHop[7:0]
  *                B2=[srcId[11:8]:4|dstId[11:8]:4]  B3=srcId[7:0]   B4=dstId[7:0]
- *                B5=[ttl[3:0]:4|spare:4]            B6=payloadLen(8)
+ *                B5=[ttl[3:0]:4|spare:4]            B6…=varint(payloadLen)
  *                payload[0..n-1]
  *
  * BEACON    8    B0=[type:4|nextHop[11:8]:4]         B1=nextHop[7:0]
@@ -51,9 +51,13 @@ private const val TYPE_MULTICAST = 3
  * MULTICAST 8+n  B0=[type:4|srcId[11:8]:4]           B1=srcId[7:0]
  *                B2=[gid[19:16]:4|ttl[3:0]:4]         B3=gid[15:8]
  *                B4=gid[7:0]                           B5=mcastSeq[15:8]
- *                B6=mcastSeq[7:0]                      B7=payloadLen(8)
+ *                B6=mcastSeq[7:0]                      B7…=varint(payloadLen)
  *                payload[0..n-1]
  * ```
+ *
+ * Payload lengths are encoded as 7-bit continuation varints (little-endian groups of 7 bits,
+ * high bit set means another byte follows). Payloads ≤127 bytes cost 1 length byte; ≤16383
+ * cost 2; ≤2097151 cost 3. No upper limit is imposed at the codec layer.
  *
  * BEACON and MULTICAST encode [GroupId] as an opaque 20-bit value (bits [19:0] of [GroupId.id]).
  */
@@ -103,20 +107,21 @@ private fun encodeOgm(frame: Frame.OgmFrame): ByteArray {
  * B7…: payload
  */
 private fun encodeData(frame: Frame.DataFrame): ByteArray {
-    val nextHop = frame.nextHop.toInt() and 0xFFF
-    val srcId   = frame.srcId.toInt()   and 0xFFF
-    val dstId   = frame.dstId.toInt()   and 0xFFF
-    val ttl     = frame.ttl.toInt()     and 0xF
-    val payload = frame.payload
-    return ByteArray(7 + payload.size).also { b ->
+    val nextHop  = frame.nextHop.toInt() and 0xFFF
+    val srcId    = frame.srcId.toInt()   and 0xFFF
+    val dstId    = frame.dstId.toInt()   and 0xFFF
+    val ttl      = frame.ttl.toInt()     and 0xF
+    val payload  = frame.payload
+    val lenBytes = encodeVarint(payload.size)
+    return ByteArray(6 + lenBytes.size + payload.size).also { b ->
         b[0] = ((TYPE_DATA shl 4) or (nextHop ushr 8)).toByte()
         b[1] = (nextHop and 0xFF).toByte()
         b[2] = ((srcId ushr 8 shl 4) or (dstId ushr 8)).toByte()
         b[3] = (srcId and 0xFF).toByte()
         b[4] = (dstId and 0xFF).toByte()
         b[5] = (ttl shl 4).toByte()
-        b[6] = payload.size.toByte()
-        payload.copyInto(b, destinationOffset = 7)
+        lenBytes.copyInto(b, destinationOffset = 6)
+        payload.copyInto(b, destinationOffset = 6 + lenBytes.size)
     }
 }
 
@@ -167,12 +172,13 @@ private fun encodeBeacon(frame: Frame.BeaconFrame): ByteArray {
  * B8…: payload
  */
 private fun encodeMulticast(frame: Frame.MulticastFrame): ByteArray {
-    val srcId    = frame.srcId.toInt()           and 0xFFF
-    val gid      = frame.groupId.id.toInt()      and 0xFFFFF
-    val ttl      = frame.ttl.toInt()             and 0xF
-    val mcastSeq = frame.seqNum.toInt()          and 0xFFFF
+    val srcId    = frame.srcId.toInt()      and 0xFFF
+    val gid      = frame.groupId.id.toInt() and 0xFFFFF
+    val ttl      = frame.ttl.toInt()        and 0xF
+    val mcastSeq = frame.seqNum.toInt()     and 0xFFFF
     val payload  = frame.payload
-    return ByteArray(8 + payload.size).also { b ->
+    val lenBytes = encodeVarint(payload.size)
+    return ByteArray(7 + lenBytes.size + payload.size).also { b ->
         b[0] = ((TYPE_MULTICAST shl 4) or (srcId ushr 8)).toByte()
         b[1] = (srcId and 0xFF).toByte()
         b[2] = ((gid ushr 16 shl 4) or ttl).toByte()
@@ -180,9 +186,40 @@ private fun encodeMulticast(frame: Frame.MulticastFrame): ByteArray {
         b[4] = (gid and 0xFF).toByte()
         b[5] = (mcastSeq ushr 8).toByte()
         b[6] = (mcastSeq and 0xFF).toByte()
-        b[7] = payload.size.toByte()
-        payload.copyInto(b, destinationOffset = 8)
+        lenBytes.copyInto(b, destinationOffset = 7)
+        payload.copyInto(b, destinationOffset = 7 + lenBytes.size)
     }
+}
+
+// ── Varint helpers ────────────────────────────────────────────────────────────
+
+private fun encodeVarint(value: Int): ByteArray {
+    require(value >= 0)
+    return when {
+        value < 0x80     -> byteArrayOf(value.toByte())
+        value < 0x4000   -> byteArrayOf((0x80 or (value and 0x7F)).toByte(), (value ushr 7).toByte())
+        value < 0x200000 -> byteArrayOf(
+            (0x80 or (value and 0x7F)).toByte(),
+            (0x80 or ((value ushr 7) and 0x7F)).toByte(),
+            (value ushr 14).toByte()
+        )
+        else -> throw IllegalArgumentException("varint payload length too large: $value")
+    }
+}
+
+/** Returns (decoded value, bytes consumed), or (-1, -1) on malformed/truncated input. */
+private fun decodeVarint(raw: ByteArray, offset: Int): Pair<Int, Int> {
+    var result = 0
+    var shift = 0
+    var pos = offset
+    while (pos < raw.size) {
+        val b = raw[pos++].toInt() and 0xFF
+        result = result or ((b and 0x7F) shl shift)
+        if (b and 0x80 == 0) return result to (pos - offset)
+        shift += 7
+        if (shift >= 21) return -1 to -1
+    }
+    return -1 to -1
 }
 
 /**
@@ -227,19 +264,19 @@ private fun decodeOgm(raw: ByteArray, b0: Int): Frame? {
 
 private fun decodeData(raw: ByteArray, b0: Int): Frame? {
     if (raw.size < 7) return null
-    val nextHop    = ((b0 and 0xF) shl 8) or (raw[1].toInt() and 0xFF)
-    val b2         = raw[2].toInt() and 0xFF
-    val srcId      = ((b2 ushr 4) shl 8) or (raw[3].toInt() and 0xFF)
-    val dstId      = ((b2 and 0xF) shl 8) or (raw[4].toInt() and 0xFF)
-    val ttl        = ((raw[5].toInt() and 0xFF) ushr 4).toUByte()
-    val payloadLen = raw[6].toInt() and 0xFF
-    if (raw.size < 7 + payloadLen) return null
+    val nextHop = ((b0 and 0xF) shl 8) or (raw[1].toInt() and 0xFF)
+    val b2      = raw[2].toInt() and 0xFF
+    val srcId   = ((b2 ushr 4) shl 8) or (raw[3].toInt() and 0xFF)
+    val dstId   = ((b2 and 0xF) shl 8) or (raw[4].toInt() and 0xFF)
+    val ttl     = ((raw[5].toInt() and 0xFF) ushr 4).toUByte()
+    val (payloadLen, varintSize) = decodeVarint(raw, 6)
+    if (varintSize < 0 || raw.size < 6 + varintSize + payloadLen) return null
     return Frame.DataFrame(
         nextHop = nextHop.toUShort(),
         srcId   = srcId.toUShort(),
         dstId   = dstId.toUShort(),
         ttl     = ttl,
-        payload = raw.copyOfRange(7, 7 + payloadLen)
+        payload = raw.copyOfRange(6 + varintSize, 6 + varintSize + payloadLen)
     )
 }
 
@@ -261,19 +298,19 @@ private fun decodeBeacon(raw: ByteArray, b0: Int): Frame? {
 
 private fun decodeMulticast(raw: ByteArray, b0: Int): Frame? {
     if (raw.size < 8) return null
-    val srcId      = ((b0 and 0xF) shl 8) or (raw[1].toInt() and 0xFF)
-    val b2         = raw[2].toInt() and 0xFF
-    val gidHi      = b2 ushr 4
-    val ttl        = (b2 and 0xF).toUByte()
-    val gid        = (gidHi shl 16) or ((raw[3].toInt() and 0xFF) shl 8) or (raw[4].toInt() and 0xFF)
-    val mcastSeq   = (((raw[5].toInt() and 0xFF) shl 8) or (raw[6].toInt() and 0xFF)).toUShort()
-    val payloadLen = raw[7].toInt() and 0xFF
-    if (raw.size < 8 + payloadLen) return null
+    val srcId    = ((b0 and 0xF) shl 8) or (raw[1].toInt() and 0xFF)
+    val b2       = raw[2].toInt() and 0xFF
+    val gidHi    = b2 ushr 4
+    val ttl      = (b2 and 0xF).toUByte()
+    val gid      = (gidHi shl 16) or ((raw[3].toInt() and 0xFF) shl 8) or (raw[4].toInt() and 0xFF)
+    val mcastSeq = (((raw[5].toInt() and 0xFF) shl 8) or (raw[6].toInt() and 0xFF)).toUShort()
+    val (payloadLen, varintSize) = decodeVarint(raw, 7)
+    if (varintSize < 0 || raw.size < 7 + varintSize + payloadLen) return null
     return Frame.MulticastFrame(
         srcId   = srcId.toUShort(),
         groupId = GroupId(gid.toUInt()),
         seqNum  = mcastSeq,
         ttl     = ttl,
-        payload = raw.copyOfRange(8, 8 + payloadLen)
+        payload = raw.copyOfRange(7 + varintSize, 7 + varintSize + payloadLen)
     )
 }
