@@ -31,7 +31,7 @@ enum class PacketFlavor {
  * concern. Rules are composed in priority order by [TxQueue]: the first rule
  * that returns a non-zero comparison wins; later rules act as tiebreakers.
  *
- * Built-in rules: [controlFirst], [olderFirst], [insertionOrderFirst].
+ * Built-in rules: [controlFirst], [userPriorityFirst], [olderFirst], [insertionOrderFirst].
  */
 typealias Rule = Comparator<TxEntry>
 
@@ -40,6 +40,13 @@ typealias Rule = Comparator<TxEntry>
  * (DATA, MULTICAST) so that routing state stays fresh under congestion.
  */
 val controlFirst: Rule = compareBy { if (it.flavor.isControl) 0 else 1 }
+
+/**
+ * Client-controlled ordering layer. Lower [TxEntry.userPriority] values are
+ * transmitted first. The default value is 0, so entries are unaffected unless
+ * the caller explicitly sets [TxEntry.userPriority] or calls [TxHandle.swap].
+ */
+val userPriorityFirst: Rule = compareBy { it.userPriority }
 
 /**
  * Among entries with the same effective priority, older frames are sent first,
@@ -56,9 +63,9 @@ val insertionOrderFirst: Rule = compareBy { it.insertionOrder }
 
 /**
  * The default rule list applied when no custom rules are supplied to [TxQueue].
- * Applies: control before data → older before newer → insertion order.
+ * Applies: control before data → client priority → older before newer → insertion order.
  */
-fun defaultRules(): List<Rule> = listOf(controlFirst, olderFirst, insertionOrderFirst)
+fun defaultRules(): List<Rule> = listOf(controlFirst, userPriorityFirst, olderFirst, insertionOrderFirst)
 
 /**
  * Global monotonically increasing counter that assigns a unique insertion order
@@ -79,13 +86,17 @@ private val insertionCounter = AtomicLong(0)
  *   ordering relative to other entries in the queue.
  * @property enqueuedAt Wall-clock time of enqueue, used by [olderFirst].
  * @property insertionOrder Globally unique tie-breaker, used by [insertionOrderFirst].
+ * @property userPriority Client-controlled ordering weight used by [userPriorityFirst].
+ *   Lower values are transmitted first; default 0 preserves standard ordering.
+ *   Mutated indirectly via [TxHandle.swap].
  */
 data class TxEntry(
     val frame: ByteArray,
     val eligibleLinks: Set<Link>,
     val flavor: PacketFlavor,
     val enqueuedAt: Instant = Instant.now(),
-    val insertionOrder: Long = insertionCounter.getAndIncrement()
+    val insertionOrder: Long = insertionCounter.getAndIncrement(),
+    val userPriority: Int = 0
 ) {
     // Identity is defined solely by insertionOrder — each TxEntry is unique.
     override fun equals(other: Any?): Boolean {
@@ -95,6 +106,69 @@ data class TxEntry(
     }
 
     override fun hashCode(): Int = insertionOrder.hashCode()
+}
+
+/**
+ * A handle returned by [TxQueue.enqueue] that lets the caller observe and
+ * mutate a queued entry before it is claimed by a link TX loop.
+ *
+ * All mutation methods ([cancel], [replace], [swap]) are no-ops (returning
+ * `false`) once the entry has been claimed for transmission.
+ */
+class TxHandle internal constructor(
+    /** Stable identifier equal to [TxEntry.insertionOrder] at enqueue time. */
+    val id: Long,
+    private val queue: TxQueue
+) {
+    internal val sentDeferred = CompletableDeferred<Unit>()
+
+    /** `true` once the entry has been claimed by a link TX loop. */
+    val isSent: Boolean get() = sentDeferred.isCompleted
+
+    /**
+     * Registers [block] to be called (on an unspecified thread, without
+     * suspending) when this entry is transmitted. Safe to call from any
+     * context; fires immediately if the entry was already sent.
+     */
+    fun onSent(block: () -> Unit) {
+        sentDeferred.invokeOnCompletion { cause -> if (cause == null) block() }
+    }
+
+    /**
+     * Suspends until this entry has been claimed by a link TX loop for
+     * transmission. Returns immediately if the entry was already sent.
+     * Must be called from a coroutine context.
+     *
+     * Example — run code after transmission in a coroutine:
+     * ```
+     * launch { handle.awaitSent(); doSomethingAsync() }
+     * ```
+     */
+    suspend fun awaitSent() = sentDeferred.await()
+
+    /**
+     * Removes the entry from the queue without transmitting it.
+     * Returns `false` if the entry was already transmitted.
+     */
+    suspend fun cancel(): Boolean = queue.cancel(this)
+
+    /**
+     * Replaces the frame bytes while keeping the entry at its current queue
+     * position. Returns `false` if the entry was already transmitted.
+     */
+    suspend fun replace(newFrame: ByteArray): Boolean = queue.replace(this, newFrame)
+
+    /**
+     * Swaps this entry's queue position with [other] by exchanging their
+     * [TxEntry.userPriority] and [TxEntry.enqueuedAt] ordering keys. After the
+     * call, this entry occupies [other]'s former position and vice versa.
+     *
+     * Note: [controlFirst] is always applied before the swapped keys, so a
+     * control frame and a data frame cannot exchange positions this way.
+     *
+     * Returns `false` if either entry was already transmitted.
+     */
+    suspend fun swap(other: TxHandle): Boolean = queue.swap(this, other)
 }
 
 /**
@@ -115,17 +189,7 @@ data class TxEntry(
  * [Comparator]. Rules are applied in list order; the first rule that returns
  * a non-zero result determines the relative position of two entries. The
  * default rule list ([defaultRules]) places control frames before data frames,
- * then breaks ties by enqueue time and finally by insertion order.
- *
- * Custom rule lists can reorder, add, or remove rules. For example, to always
- * drain OGMs before beacons before all other control frames:
- * ```
- * val q = TxQueue(listOf(
- *     compareBy { when (it.flavor) { OGM -> 0; BEACON -> 1; else -> 2 } },
- *     olderFirst,
- *     insertionOrderFirst
- * ))
- * ```
+ * then applies client priority, then breaks ties by enqueue time and insertion order.
  *
  * ## Eligible-link work stealing
  *
@@ -133,6 +197,13 @@ data class TxEntry(
  * single target. The first link whose TX coroutine becomes free and calls
  * [pollFor] claims the entry exclusively, enabling natural load-balancing
  * across redundant paths without any explicit scheduler.
+ *
+ * ## Handles
+ *
+ * [enqueue] returns a [TxHandle] that allows the caller to receive a
+ * notification when the entry is transmitted ([TxHandle.onSent]), cancel the
+ * entry ([TxHandle.cancel]), replace its frame bytes ([TxHandle.replace]), or
+ * swap its queue position with another entry ([TxHandle.swap]).
  *
  * ## Suspension
  *
@@ -142,7 +213,7 @@ data class TxEntry(
  *
  * ## Thread safety
  *
- * All mutations to [entries] are guarded by [mutex].
+ * All mutations to [entries], [entryIndex], and [handleIndex] are guarded by [mutex].
  */
 class TxQueue(rules: List<Rule> = defaultRules()) {
     private val mutex = Mutex()
@@ -153,6 +224,12 @@ class TxQueue(rules: List<Rule> = defaultRules()) {
     /** Sorted set of pending entries, ordered by the composite [comparator]. */
     private val entries = TreeSet<TxEntry>(comparator)
 
+    /** Maps handle [TxHandle.id] to the current [TxEntry] in [entries]. Updated by [replace] and [swap]. */
+    private val entryIndex = HashMap<Long, TxEntry>()
+
+    /** Maps handle [TxHandle.id] to its [TxHandle], so [pollFor] can complete [TxHandle.sentDeferred]. */
+    private val handleIndex = HashMap<Long, TxHandle>()
+
     /**
      * Per-link queues of suspended [pollFor] callers waiting for a frame.
      * When a frame is enqueued whose eligible set includes a link that has a
@@ -162,22 +239,31 @@ class TxQueue(rules: List<Rule> = defaultRules()) {
     private val waiters = ConcurrentHashMap<String, ArrayDeque<CompletableDeferred<TxEntry>>>()
 
     /**
-     * Adds [entry] to the queue, or delivers it directly to a waiting [pollFor]
-     * caller if one exists for any of the entry's [TxEntry.eligibleLinks].
+     * Adds [entry] to the queue and returns a [TxHandle] for tracking and
+     * mutating it. If a link TX loop is already waiting for an eligible frame,
+     * the entry is delivered immediately (bypassing the sorted set) and
+     * [TxHandle.isSent] will already be `true` when this call returns.
      *
      * Eligible links are checked in iteration order; the first link with a
      * waiting coroutine claims the entry. If no waiter is found the entry is
      * parked in the sorted set until a link calls [pollFor].
      */
-    suspend fun enqueue(entry: TxEntry) = mutex.withLock {
-        val waiter = entry.eligibleLinks
-            .firstNotNullOfOrNull { link -> waiters[link.id]?.takeIf { it.isNotEmpty() } }
-            ?.removeFirst()
-        if (waiter != null) {
-            waiter.complete(entry)
-        } else {
-            entries.add(entry)
+    suspend fun enqueue(entry: TxEntry): TxHandle {
+        val handle = TxHandle(entry.insertionOrder, this)
+        mutex.withLock {
+            val waiter = entry.eligibleLinks
+                .firstNotNullOfOrNull { link -> waiters[link.id]?.takeIf { it.isNotEmpty() } }
+                ?.removeFirst()
+            if (waiter != null) {
+                waiter.complete(entry)
+                handle.sentDeferred.complete(Unit)
+            } else {
+                entries.add(entry)
+                entryIndex[handle.id] = entry
+                handleIndex[handle.id] = handle
+            }
         }
+        return handle
     }
 
     /**
@@ -188,6 +274,9 @@ class TxQueue(rules: List<Rule> = defaultRules()) {
      * between "nothing available" and "enqueue arrives": if a frame is enqueued
      * between the check and the suspension, the enqueue path will find the waiter
      * and complete the deferred before [await] is even called.
+     *
+     * When an entry is claimed, [TxHandle.sentDeferred] is completed so that
+     * any [TxHandle.onSent] callbacks fire.
      */
     suspend fun pollFor(link: Link): TxEntry {
         val deferred = CompletableDeferred<TxEntry>()
@@ -195,11 +284,58 @@ class TxQueue(rules: List<Rule> = defaultRules()) {
             val entry = entries.firstOrNull { link in it.eligibleLinks }
             if (entry != null) {
                 entries.remove(entry)
+                entryIndex.remove(entry.insertionOrder)
+                val handle = handleIndex.remove(entry.insertionOrder)
                 deferred.complete(entry)
+                handle?.sentDeferred?.complete(Unit)
             } else {
                 waiters.getOrPut(link.id) { ArrayDeque() }.addLast(deferred)
             }
         }
         return deferred.await()
+    }
+
+    /**
+     * Removes the entry referenced by [handle] from the queue.
+     * Returns `false` if the entry was already transmitted.
+     */
+    internal suspend fun cancel(handle: TxHandle): Boolean = mutex.withLock {
+        val entry = entryIndex.remove(handle.id) ?: return@withLock false
+        handleIndex.remove(handle.id)
+        entries.remove(entry)
+        true
+    }
+
+    /**
+     * Swaps the frame bytes of the entry referenced by [handle] while keeping
+     * it at its current position in the queue.
+     * Returns `false` if the entry was already transmitted.
+     */
+    internal suspend fun replace(handle: TxHandle, newFrame: ByteArray): Boolean = mutex.withLock {
+        val entry = entryIndex[handle.id] ?: return@withLock false
+        entries.remove(entry)
+        val updated = entry.copy(frame = newFrame)
+        entries.add(updated)
+        entryIndex[handle.id] = updated
+        true
+    }
+
+    /**
+     * Swaps the queue positions of the entries referenced by [h1] and [h2] by
+     * exchanging their [TxEntry.userPriority] and [TxEntry.enqueuedAt] ordering
+     * keys. Returns `false` if either entry was already transmitted.
+     */
+    internal suspend fun swap(h1: TxHandle, h2: TxHandle): Boolean = mutex.withLock {
+        val e1 = entryIndex[h1.id] ?: return@withLock false
+        val e2 = entryIndex[h2.id] ?: return@withLock false
+        entries.remove(e1)
+        entries.remove(e2)
+        val e1new = e1.copy(userPriority = e2.userPriority, enqueuedAt = e2.enqueuedAt)
+        val e2new = e2.copy(userPriority = e1.userPriority, enqueuedAt = e1.enqueuedAt)
+        entries.add(e1new)
+        entries.add(e2new)
+        entryIndex[h1.id] = e1new
+        entryIndex[h2.id] = e2new
+        true
     }
 }
