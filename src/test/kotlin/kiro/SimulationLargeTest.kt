@@ -37,9 +37,11 @@ class SimulationLargeTest {
     // drastically reducing coroutine-scheduler contention in 40–45 node simulations.
     private fun lnk(id: String, med: SimMedium) = simLink(id, med, OGM_INTERVAL)
 
+    private val nodeById = mutableMapOf<Int, KiroRouter>()
+
     private fun node(id: Int, vararg links: Link) =
         KiroRouter(selfId = id.toUShort(), links = links.toList(),
-            staleThreshold = STALE, neighborPurgeMultiplier = PURGE_MULT)
+            staleThreshold = STALE, neighborPurgeMultiplier = PURGE_MULT).also { nodeById[id] = it }
 
     private fun CoroutineScope.startKillable(n: KiroRouter): CompletableJob {
         val job = SupervisorJob(coroutineContext[Job])
@@ -64,8 +66,8 @@ class SimulationLargeTest {
     private suspend fun KiroRouter.sendTo(dst: Int, text: String) =
         send(dst.toUShort(), text.encodeToByteArray())
 
-    private suspend fun KiroRouter.inviteTo(gid: GroupId, dst: Int) =
-        invite(gid, dst.toUShort())
+    private fun joinAs(gid: GroupId, dst: Int) =
+        nodeById[dst]!!.joinGroup(gid)
 
     /**
      * Listens on [rx].incomingData, then sends [text] to [dst] every 1.5 s until received.
@@ -148,7 +150,7 @@ class SimulationLargeTest {
         // ── Multicast: D1(3) owns, one access node per distribution group ──
         delay(OGM_LARGE)   // let routes via C2 fully stabilize before issuing invites
         val gid = dist[0].createGroup()
-        for (i in 0 until 8) dist[0].inviteTo(gid, 11 + i * 4)  // A1, A5, A9, A13...
+        for (i in 0 until 8) joinAs(gid, 11 + i * 4)  // A1, A5, A9, A13...
         delay(TREE_BUILD)
 
         val defs = Array(8) { CompletableDeferred<MulticastMessage>() }
@@ -216,7 +218,7 @@ class SimulationLargeTest {
 
         // ── Multicast: node 1 owns, nodes 21 and 31 join (node 11 dead, skip) ──
         val gid = nodes[0].createGroup()
-        nodes[0].inviteTo(gid, 21); nodes[0].inviteTo(gid, 31)
+        joinAs(gid, 21); joinAs(gid, 31)
         delay(TREE_BUILD)
 
         val got21 = CompletableDeferred<MulticastMessage>()
@@ -306,7 +308,7 @@ class SimulationLargeTest {
         // via spine[3]. Wait for those alternative routes to fully converge before inviting.
         delay(OGM_LARGE)
         val gid = spines[0].createGroup()
-        for (l in 0 until LEAVES) spines[0].inviteTo(gid, SPINES + LEAVES + l * HOSTS_PER_LEAF + 1)
+        for (l in 0 until LEAVES) joinAs(gid, SPINES + LEAVES + l * HOSTS_PER_LEAF + 1)
         delay(TREE_BUILD)
         delay(TREE_BUILD)
         delay(TREE_BUILD)  // 3× TREE_BUILD: under full-suite load actual beacon interval is 3-4× slower
@@ -386,7 +388,7 @@ class SimulationLargeTest {
 
         // ── Multicast from S1(2), one leaf per secondary group ──
         val gid = secs[0].createGroup()
-        for (i in 0 until SECS) secs[0].inviteTo(gid, 10 + i * LEAVES_PER)
+        for (i in 0 until SECS) joinAs(gid, 10 + i * LEAVES_PER)
         delay(TREE_BUILD)
 
         val mDefs = Array(SECS) { CompletableDeferred<MulticastMessage>() }
@@ -662,9 +664,9 @@ class SimulationLargeTest {
         grid.forEach { row -> row.forEach { nd -> if (nd !== n(21)) nd.start(this) } }
         delay(OGM_LARGE)
 
-        val g1 = n(1).createGroup();  n(1).inviteTo(g1, 8);  n(1).inviteTo(g1, 33); n(1).inviteTo(g1, 40)
-        val g2 = n(20).createGroup(); n(20).inviteTo(g2, 1); n(20).inviteTo(g2, 21); n(20).inviteTo(g2, 40)
-        val g3 = n(40).createGroup(); n(40).inviteTo(g3, 1); n(40).inviteTo(g3, 8);  n(40).inviteTo(g3, 20)
+        val g1 = n(1).createGroup();  joinAs(g1, 8);  joinAs(g1, 33); joinAs(g1, 40)
+        val g2 = n(20).createGroup(); joinAs(g2, 1); joinAs(g2, 21); joinAs(g2, 40)
+        val g3 = n(40).createGroup(); joinAs(g3, 1); joinAs(g3, 8);  joinAs(g3, 20)
         delay(TREE_BUILD)
 
         fun sendGroup(owner: KiroRouter, gid: GroupId, label: String,
@@ -854,7 +856,7 @@ class SimulationLargeTest {
 
         // ── Multicast: inner[0](9) owns, first leaf of each inner node joins ──
         val gid = inner[0].createGroup()
-        for (i in 0 until RING) inner[0].inviteTo(gid, RING * 2 + i * LEAVES_PER + 1)
+        for (i in 0 until RING) joinAs(gid, RING * 2 + i * LEAVES_PER + 1)
         delay(TREE_BUILD)
 
         val mDefs = Array(RING) { CompletableDeferred<MulticastMessage>() }
@@ -939,7 +941,7 @@ class SimulationLargeTest {
         // G1 members chosen on BB1, BB2, BB8, BB9 — the only surviving backbone nodes after
         // killing BB3, BB5, BB7 (which also isolates BB4 and BB6 from the ring).
         val g1 = bb(1).createGroup()
-        listOf(1, 5, 29, 33).forEach { ac -> bb(1).inviteTo(g1, BB + ac) }
+        listOf(1, 5, 29, 33).forEach { ac -> joinAs(g1, BB + ac) }
         // G2 owner BB5 will be killed in sequential step 2 — skip G2 entirely.
         delay(TREE_BUILD)
 

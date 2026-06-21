@@ -125,14 +125,11 @@ Multicast is built on a per-group spanning tree. Members send periodic **beacons
 
 ```kotlin
 val gid: GroupId = router.createGroup()
-
-// Invite members. Deputies are fallback roots if this node goes offline.
-router.invite(gid, memberId = 0x002u, deputies = listOf(0x003u))
 ```
 
 ### Joining a group (member)
 
-Membership is established automatically upon receiving an `InviteFrame`. You can also join programmatically:
+Membership information is delivered by the application layer (e.g. embedded in a data message). Once a node knows which group to join, it calls:
 
 ```kotlin
 router.joinGroup(gid, deputies = listOf(0x003u), beaconInterval = 30.seconds)
@@ -240,29 +237,8 @@ All frames are bit-packed big-endian. Byte 0 always carries the 4-bit type tag i
 | `DataFrame` | 7 + n bytes | nextHop(12b) + src(12b) + dst(12b) + ttl(4b) + len(8b) + payload |
 | `BeaconFrame` | 9 bytes | nextHop(12b) + src(12b) + groupId(28b) + activeRoot(12b) |
 | `MulticastFrame` | 9 + n bytes | src(12b) + groupId(28b) + seqNum(16b) + ttl(4b) + len(8b) + payload |
-| `InviteFrame` | 9 + 2d bytes | nextHop(12b) + src(12b) + dst(12b) + groupId(28b) + d deputies(12b each) |
 
 `Codec.encode` and `Codec.decode` handle serialisation. `decode` returns `null` for malformed or unknown frames; the router silently drops them.
-
----
-
-## Formal verification
-
-`kiro.pml` is a SPIN/Promela model of the routing core on a 3-node linear chain (`N0 — N1 — N2`). Relay suppression is modelled as a non-deterministic choice (over-approximation); weak fairness (`-f`) captures the real protocol's guarantee that relay probability is always > 0.
-
-```
-LTL property          pan (no flags)   pan -a -f
-route_convergence     counterexample   holds
-correct_delivery      counterexample   holds
-delivery_monotone     holds            holds
-```
-
-```bash
-spin -a kiro.pml && cc -o pan pan.c
-./pan              # safety only
-./pan -a -f        # all LTL claims with weak fairness
-spin kiro.pml    # simulate one execution
-```
 
 ---
 

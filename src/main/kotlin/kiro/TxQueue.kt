@@ -16,14 +16,14 @@ import java.util.concurrent.atomic.AtomicLong
  * [controlFirst] built-in rule, but callers can define arbitrary rules that
  * treat individual flavors differently (e.g. rank beacons above OGMs).
  *
- * [isControl] groups the network-management flavors (OGM, BEACON, INVITE)
+ * [isControl] groups the network-management flavors (OGM, BEACON)
  * that must be delivered promptly to keep routing state fresh, as opposed to
  * application-data flavors (DATA, MULTICAST) that can tolerate queueing.
  */
 enum class PacketFlavor {
-    OGM, BEACON, INVITE, MULTICAST, DATA;
+    OGM, BEACON, MULTICAST, DATA;
 
-    val isControl: Boolean get() = this == OGM || this == BEACON || this == INVITE
+    val isControl: Boolean get() = this == OGM || this == BEACON
 }
 
 /**
@@ -36,7 +36,7 @@ enum class PacketFlavor {
 typealias Rule = Comparator<TxEntry>
 
 /**
- * Control flavors (OGM, BEACON, INVITE) are transmitted before data flavors
+ * Control flavors (OGM, BEACON) are transmitted before data flavors
  * (DATA, MULTICAST) so that routing state stays fresh under congestion.
  */
 val controlFirst: Rule = compareBy { if (it.flavor.isControl) 0 else 1 }

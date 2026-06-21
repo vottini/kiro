@@ -146,6 +146,16 @@ class MulticastTree {
     }
 
     /**
+     * Immediately removes all upstream and downstream tree state for [groupId].
+     * Called when a node explicitly leaves a group so that the tree entries do
+     * not linger until the next [evictStale] pass.
+     */
+    fun remove(groupId: GroupId) {
+        upstream.remove(groupId)
+        downstream.remove(groupId)
+    }
+
+    /**
      * Removes all [LinkEntry] records whose [LinkEntry.lastSeen] is older than
      * [threshold], and removes any group entries that become empty as a result.
      *

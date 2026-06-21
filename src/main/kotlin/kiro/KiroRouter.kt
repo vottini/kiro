@@ -49,12 +49,12 @@ data class MulticastMessage(val srcId: NodeId, val groupId: GroupId, val payload
  *
  * ## Multicast groups
  *
- * A group owner calls [createGroup] to obtain a [GroupId], then [invite]s members.
- * Each invited member joins via [joinGroup] and begins sending periodic
- * [Frame.BeaconFrame]s toward the owner. Relay nodes record both legs of each
- * beacon's path in [multicastTree], building a spanning tree. Any group member or
- * the owner can then call [sendMulticast] to reach all members via tree-based
- * forwarding rather than network-wide flooding.
+ * A group owner calls [createGroup] to obtain a [GroupId]. Members join by calling
+ * [joinGroup] directly (membership is managed at the application layer). Each member
+ * begins sending periodic [Frame.BeaconFrame]s toward the owner. Relay nodes record
+ * both legs of each beacon's path in [multicastTree], building a spanning tree. Any
+ * group member or the owner can then call [sendMulticast] to reach all members via
+ * tree-based forwarding rather than network-wide flooding.
  *
  * ## Concurrency model
  *
@@ -116,13 +116,7 @@ class KiroRouter(
     private val localGroups = ConcurrentHashMap.newKeySet<GroupId>()
 
     /**
-     * Groups owned by this node, mapping groupId to the set of invited members.
-     * Only populated on the owner node; used to track who has been invited.
-     */
-    private val ownedGroups = ConcurrentHashMap<GroupId, MutableSet<NodeId>>()
-
-    /**
-     * Ordered fallback roots per group, stored when this node joins via an invite.
+     * Ordered fallback roots per group, stored when this node joins a group.
      * [beaconLoop] tries [GroupId.owner] first, then each deputy in order, sending
      * beacons toward the first one that has a known route in [neighborTable].
      */
@@ -196,29 +190,7 @@ class KiroRouter(
     fun createGroup(): GroupId {
         val gid = GroupId(selfId, groupSeq.getAndIncrement().toUShort())
         localGroups.add(gid)
-        ownedGroups[gid] = ConcurrentHashMap.newKeySet<NodeId>().also { it.add(selfId) }
         return gid
-    }
-
-    /**
-     * Sends a [Frame.InviteFrame] to [memberId] for group [gid].
-     * The invited node will call [joinGroup] upon receipt and begin sending beacons,
-     * which builds its branch of the multicast spanning tree.
-     *
-     * [deputies] is an ordered list of fallback tree roots. If the primary owner
-     * becomes unreachable, the invitee will beacon toward the first deputy that has
-     * a known route, keeping the spanning tree alive without intervention.
-     *
-     * Silently drops if no route to [memberId] is known yet.
-     */
-    suspend fun invite(gid: GroupId, memberId: NodeId, deputies: List<NodeId> = emptyList()) {
-        val route = neighborTable[memberId] ?: return
-        ownedGroups[gid]?.add(memberId)
-        txQueue.enqueue(TxEntry(
-            frame         = encode(Frame.InviteFrame(route.nextHop, selfId, memberId, gid, deputies)),
-            eligibleLinks = setOf(route.link),
-            flavor        = PacketFlavor.INVITE
-        ))
     }
 
     // -------------------------------------------------------------------------
@@ -245,6 +217,27 @@ class KiroRouter(
         localGroups.add(gid)
         if (deputies.isNotEmpty()) groupDeputies[gid] = deputies
         scope.launch { beaconLoop(gid, beaconInterval) }
+    }
+
+    /**
+     * Removes this node from group [gid].
+     *
+     * The beacon loop for [gid] exits on its next iteration (it checks [localGroups]
+     * each cycle), so the upstream branch naturally expires on other nodes within
+     * one [staleThreshold] period without requiring any explicit leave message.
+     * The local tree state is cleared immediately so this node stops relaying
+     * multicasts for the group right away.
+     *
+     * Returns `true` if this node was a member, `false` if it was not.
+     */
+    fun leaveGroup(gid: GroupId): Boolean {
+        val wasMember = localGroups.remove(gid)
+        if (!wasMember) return false
+        groupDeputies.remove(gid)
+        // Tree state is NOT cleared here: if this node sits between remaining members,
+        // their beacons still flow through it and handleBeacon keeps the relay entries
+        // fresh. Stale entries are pruned naturally by staleEvictionLoop once beacons stop.
+        return true
     }
 
     // -------------------------------------------------------------------------
@@ -399,7 +392,6 @@ class KiroRouter(
                 is Frame.OgmFrame       -> handleOgm(frame.ogm, link)
                 is Frame.DataFrame      -> handleData(frame)
                 is Frame.BeaconFrame    -> handleBeacon(frame, link)
-                is Frame.InviteFrame    -> handleInvite(frame)
                 is Frame.MulticastFrame -> handleMulticast(frame, link)
                 null                    -> Unit  // malformed or unknown type
             }
@@ -568,27 +560,6 @@ class KiroRouter(
             frame         = encode(frame.copy(nextHop = route.nextHop)),
             eligibleLinks = setOf(route.link),
             flavor        = PacketFlavor.BEACON
-        ))
-    }
-
-    /**
-     * Handles a [Frame.InviteFrame] from a group owner:
-     *  - Drops frames not addressed to this node ([nextHop] check).
-     *  - If this is the final destination, calls [joinGroup] to register membership
-     *    and start the beacon loop that builds this node's tree branch.
-     *  - Otherwise, forwards the invite toward [dstId] via unicast routing.
-     */
-    private suspend fun handleInvite(frame: Frame.InviteFrame) {
-        if (frame.nextHop != selfId) return
-        if (frame.dstId == selfId) {
-            joinGroup(frame.groupId, frame.deputies)
-            return
-        }
-        val route = neighborTable[frame.dstId] ?: return
-        txQueue.enqueue(TxEntry(
-            frame         = encode(frame.copy(nextHop = route.nextHop)),
-            eligibleLinks = setOf(route.link),
-            flavor        = PacketFlavor.INVITE
         ))
     }
 

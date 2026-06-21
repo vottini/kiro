@@ -43,14 +43,6 @@ class CodecTest {
         payload: ByteArray = byteArrayOf(0xAA.toByte(), 0xBB.toByte())
     ) = Frame.MulticastFrame(src, gid, seq, ttl, payload)
 
-    private fun invite(
-        nextHop: UShort = 4u,
-        src: UShort = 10u,
-        dst: UShort = 7u,
-        gid: GroupId = GroupId(10u, 2u),
-        deputies: List<UShort> = emptyList()
-    ) = Frame.InviteFrame(nextHop, src, dst, gid, deputies)
-
     // ── OGM ──────────────────────────────────────────────────────────────────
 
     @Nested inner class OgmFrameTests {
@@ -222,65 +214,6 @@ class CodecTest {
         }
     }
 
-    // ── InviteFrame ───────────────────────────────────────────────────────────
-
-    @Nested inner class InviteFrameTests {
-
-        @Test fun `round-trip no deputies`() {
-            assertEquals(invite(), roundTrip(invite()))
-        }
-
-        @Test fun `round-trip one deputy`() {
-            val f = invite(deputies = listOf(50u))
-            assertEquals(f, roundTrip(f))
-        }
-
-        @Test fun `round-trip three deputies`() {
-            val f = invite(deputies = listOf(50u, 100u, 200u))
-            assertEquals(f, roundTrip(f))
-        }
-
-        @Test fun `round-trip boundary values with deputies`() {
-            val f = invite(
-                nextHop  = 0xFFFu,
-                src      = 0xFFFu,
-                dst      = 0xFFFu,
-                gid      = GroupId(0xFFFu, 0xFFFFu),
-                deputies = listOf(0xFFFu, 0u)
-            )
-            assertEquals(f, roundTrip(f))
-        }
-
-        @Test fun `round-trip zero values no deputies`() {
-            val f = invite(nextHop = 0u, src = 0u, dst = 0u, gid = GroupId(0u, 0u))
-            assertEquals(f, roundTrip(f))
-        }
-
-        @Test fun `encoded length is 9 bytes with no deputies`() {
-            assertEquals(9, encode(invite()).size)
-        }
-
-        @Test fun `encoded length grows by 2 bytes per deputy`() {
-            assertEquals(11, encode(invite(deputies = listOf(1u))).size)
-            assertEquals(13, encode(invite(deputies = listOf(1u, 2u))).size)
-            assertEquals(15, encode(invite(deputies = listOf(1u, 2u, 3u))).size)
-        }
-
-        @Test fun `type nibble is TYPE_INVITE (4)`() {
-            assertEquals(4, (encode(invite())[0].toInt() and 0xFF) ushr 4)
-        }
-
-        @Test fun `truncated frame decodes to null`() {
-            assertNull(decode(encode(invite()).copyOf(8)))
-        }
-
-        @Test fun `frame truncated mid-deputy list decodes to null`() {
-            val raw = encode(invite(deputies = listOf(50u, 100u)))
-            // Truncate after the deputy count byte but before all deputy bytes
-            assertNull(decode(raw.copyOf(10)))
-        }
-    }
-
     // ── decode edge cases ─────────────────────────────────────────────────────
 
     @Nested inner class DecodeEdgeCases {
@@ -295,7 +228,7 @@ class CodecTest {
 
         @Test fun `all frame types survive distinct type nibbles`() {
             // Ensures no two frame types share the same nibble.
-            val nibbles = listOf(ogm(), data(), beacon(), multicast(), invite())
+            val nibbles = listOf(ogm(), data(), beacon(), multicast())
                 .map { (encode(it)[0].toInt() and 0xFF) ushr 4 }
             assertEquals(nibbles.distinct().size, nibbles.size)
         }
