@@ -490,13 +490,24 @@ class BatmanRouter(
 
     /**
      * Updates [neighborTable] when an OGM from [ogm.originatorId] is received.
-     * If [ogm.ttl] beats the current best, the route is replaced. Otherwise,
-     * [lastSeen] is still refreshed so the entry is not evicted by the purge loop
-     * during stable topologies where the best TTL never changes.
+     *
+     * The route is replaced whenever [ogm.ttl] is at least as good as the current
+     * best (≥ rather than strictly >). This has two effects:
+     *
+     *  1. **Liveness**: a stable topology keeps re-electing the same or an equivalent
+     *     sender each cycle, so [lastSeen] is refreshed and the entry never goes stale.
+     *  2. **Fast rerouting**: when two equal-quality paths exist and one disappears,
+     *     the surviving path's OGMs naturally take over on the next cycle without
+     *     waiting for the stale entry to expire.
+     *
+     * OGMs arriving via a strictly worse path (lower TTL) are ignored. If the
+     * current best path fails and only a worse path remains, the entry expires
+     * naturally after [neighborPurgeMultiplier] × [Link.ogmInterval], and the
+     * next OGM from the worse path creates a new (lower-quality) entry.
      */
     private fun updateNeighborTable(ogm: Ogm, link: Link) {
         val current = neighborTable[ogm.originatorId]
-        if (current == null || ogm.ttl > current.bestTtl) {
+        if (current == null || ogm.ttl >= current.bestTtl) {
             neighborTable[ogm.originatorId] = NeighborEntry(
                 nextHop  = ogm.senderId,
                 link     = link,
@@ -504,8 +515,6 @@ class BatmanRouter(
                 lastSeq  = ogm.seqNum,
                 lastSeen = Instant.now()
             )
-        } else {
-            neighborTable[ogm.originatorId] = current.copy(lastSeen = Instant.now(), lastSeq = ogm.seqNum)
         }
     }
 

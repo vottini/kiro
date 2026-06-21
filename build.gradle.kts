@@ -22,4 +22,6 @@ kotlin {
 
 tasks.test {
     useJUnitPlatform()
+    // ZGC keeps GC pause times below 1 ms, preventing route-table eviction in large coroutine simulations.
+    jvmArgs("-Xmx1g", "-XX:+UseZGC")
 }
