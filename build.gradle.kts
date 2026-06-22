@@ -10,7 +10,11 @@ version = "0.0.1"
 kotlin {
     jvmToolchain(17)
     jvm()
-    androidTarget()
+    android {
+        namespace = "systems.untangle.kiro"
+        compileSdk = 35
+        minSdk = 26  // required for java.time.* APIs
+    }
 
     sourceSets {
         // Intermediate source set: both JVM and Android inherit from here.
@@ -22,7 +26,7 @@ kotlin {
                 implementation(libs.kotlinx.coroutines.core)
             }
         }
-        jvmMain   { dependsOn(jvmAndAndroidMain) }
+        jvmMain     { dependsOn(jvmAndAndroidMain) }
         androidMain { dependsOn(jvmAndAndroidMain) }
 
         jvmTest {
@@ -32,18 +36,6 @@ kotlin {
                 implementation(libs.kotlinx.coroutines.test)
             }
         }
-    }
-}
-
-android {
-    namespace = "systems.untangle.kiro"
-    compileSdk = 35
-    defaultConfig {
-        minSdk = 26  // required for java.time.* APIs
-    }
-    compileOptions {
-        sourceCompatibility = JavaVersion.VERSION_17
-        targetCompatibility = JavaVersion.VERSION_17
     }
 }
 
