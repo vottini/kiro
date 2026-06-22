@@ -1,6 +1,7 @@
 /build/
 /.gradle/
 /.claude/
+/.kotlin/
 /.idea/
 /batman/
 /META-INF/

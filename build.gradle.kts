@@ -2,6 +2,7 @@
 plugins {
     alias(libs.plugins.kotlin.multiplatform)
     alias(libs.plugins.android.library)
+    alias(libs.plugins.maven.publish)
 }
 
 group = "systems.untangle"
@@ -26,6 +27,7 @@ kotlin {
                 implementation(libs.kotlinx.coroutines.core)
             }
         }
+
         jvmMain     { dependsOn(jvmAndAndroidMain) }
         androidMain { dependsOn(jvmAndAndroidMain) }
 
@@ -35,6 +37,44 @@ kotlin {
                 implementation(libs.junit.jupiter)
                 implementation(libs.kotlinx.coroutines.test)
             }
+        }
+    }
+}
+
+mavenPublishing {
+    publishToMavenCentral()
+    signAllPublications()
+
+    coordinates(
+        group.toString(),
+        "kiro",
+        version.toString()
+    )
+
+    pom {
+        name = "Kiro"
+        description = "BATMAN routing algorithm implemented at application level"
+        inceptionYear = "2026"
+        url = "https://github.com/vottini/kiro"
+
+        licenses {
+            license {
+                name = "MIT"
+                url = "https://opensource.org/licenses/MIT"
+            }
+        }
+
+        developers {
+            developer {
+                name = "Gustavo Venturini"
+                email = "gustavo.c.venturini@gmail.com"
+            }
+        }
+
+        scm {
+            url = "https://github.com/vottini/kiro"
+            connection = "scm:git:git://github.com/vottini/kiro.git"
+            developerConnection = "scm:git:ssh://git@github.com/vottini/kiro.git"
         }
     }
 }
