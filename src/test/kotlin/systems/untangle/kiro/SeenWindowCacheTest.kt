@@ -1,4 +1,4 @@
-package kiro
+package systems.untangle.kiro
 
 import kotlin.test.Test
 import kotlin.test.assertFalse

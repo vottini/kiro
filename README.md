@@ -23,7 +23,7 @@ Add the dependency to your `build.gradle.kts`:
 
 ```kotlin
 dependencies {
-    implementation("kiro:kiro:1.0-SNAPSHOT")
+    implementation("systems.untangle:kiro:1.0-SNAPSHOT")
 }
 ```
 

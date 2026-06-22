@@ -1,19 +1,20 @@
+
 plugins {
-    kotlin("jvm") version "2.0.0"
+    alias(libs.plugins.kotlin.jvm)
 }
 
-group = "kiro"
-version = "1.0-SNAPSHOT"
+group = "systems.untangle"
+version = "0.0.1"
 
 repositories {
     mavenCentral()
 }
 
 dependencies {
-    implementation("org.jetbrains.kotlinx:kotlinx-coroutines-core:1.8.1")
+    implementation(libs.kotlinx.coroutines.core)
     testImplementation(kotlin("test"))
-    testImplementation("org.junit.jupiter:junit-jupiter:5.10.2")
-    testImplementation("org.jetbrains.kotlinx:kotlinx-coroutines-test:1.8.1")
+    testImplementation(libs.junit.jupiter)
+    testImplementation(libs.kotlinx.coroutines.test)
 }
 
 kotlin {

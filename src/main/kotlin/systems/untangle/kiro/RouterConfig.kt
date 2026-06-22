@@ -1,4 +1,4 @@
-package kiro
+package systems.untangle.kiro
 
 import kotlin.math.roundToInt
 import kotlin.time.Duration

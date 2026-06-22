@@ -1,4 +1,4 @@
-package kiro
+package systems.untangle.kiro
 
 import org.junit.jupiter.api.Assertions.assertArrayEquals
 import org.junit.jupiter.api.Nested
