@@ -1,8 +1,8 @@
-# kiro
+# Kiro
 
 A Kotlin/JVM implementation of the [BATMAN](https://www.open-mesh.org/projects/open-mesh/wiki/BATMANv4) (Better Approach To Mobile Ad-hoc Networking) routing protocol for heterogeneous, band-limited radio meshes.
 
-The library runs entirely at the application layer — no kernel modules, no raw sockets — making it suitable for embedded JVM targets, LoRa networks, serial radio bridges, or any environment where the physical link is exposed as a simple send/receive primitive.
+The library runs entirely at the application layer — no kernel modules, no raw sockets — making it suitable for embedded JVM targets, any environment where the physical link is exposed as a simple send/receive primitive.
 
 ---
 
@@ -12,22 +12,26 @@ The library runs entirely at the application layer — no kernel modules, no raw
 - **Jitter-based relay suppression** — in a dense subnet of N neighbours, expected relays ≈ ln(N) instead of N−1
 - **Beacon-driven multicast spanning trees** — members build the tree themselves; no network-wide flooding
 - **Pull-model transmit queue** with rule-based ordering and per-handle cancellation, replacement and reordering
-- **Compact wire format** — 6 bytes for an OGM, 8 bytes for a beacon, up to 255-byte payloads
+- **Compact wire format** — 6 bytes for an OGM, 8 bytes for a beacon, varint-encoded payload length (no upper limit at the codec layer)
 - **Fully coroutine-native** — every loop suspends instead of polling; slow radios never block fast ones
 
 ---
 
 ## Installation
 
+Kiro is available at Maven Central.  
 Add the dependency to your `build.gradle.kts`:
 
 ```kotlin
 dependencies {
-    implementation("systems.untangle:kiro:1.0-SNAPSHOT")
+    implementation("systems.untangle:kiro:0.1.1")
 }
 ```
 
-Requirements: **Kotlin 2.0+**, **JVM 17+**, `kotlinx-coroutines-core 1.8+`.
+Requirements:
+ - **JVM 17+**
+ - **Kotlin 2.3+**
+ - `kotlinx-coroutines-core 1.10+`.
 
 ---
 
@@ -250,3 +254,54 @@ Payload lengths use a 7-bit continuation varint: lengths ≤127 cost 1 byte, ≤
 **Why separate upstream and downstream links in MulticastTree?** It enables two optimisations: leaf suppression (a relay whose downstream members are actively beaconing does not need to send its own beacon) and immediate upstream replacement (when the best route to the root changes, the old upstream link is discarded atomically, preventing duplicate multicast transmissions during reroutes).
 
 **Why activeRoot carried in BeaconFrame?** Relay nodes need no local configuration. The active root is embedded in every beacon, so any node can forward toward the correct root without knowing the group's root list.
+
+---
+
+## Demo CLI
+
+The `:demo` submodule ships a self-contained fat JAR that simulates a mesh over named FIFO pipes. Each **medium** is a directory; nodes on the same medium share a broadcast channel. New nodes are discovered automatically — no neighbor list required.
+
+### Build
+
+```sh
+./gradlew :demo:shadowJar
+# Output: demo/build/libs/kiro-demo.jar
+```
+
+### Run
+
+```
+java -jar kiro-demo.jar <nodeId> <medium1> [<medium2> ...]
+```
+
+Each medium path is a directory that will be created on first use. A node listening on the same directory as another node can hear its broadcasts.
+
+### Example topology
+
+Three nodes sharing two overlapping media:
+
+```sh
+# Terminal 1 — node 1 on net-a only
+java -jar kiro-demo.jar 1 /tmp/net-a
+
+# Terminal 2 — node 2 bridges net-a and net-b
+java -jar kiro-demo.jar 2 /tmp/net-a /tmp/net-b
+
+# Terminal 3 — node 3 on net-b only
+java -jar kiro-demo.jar 3 /tmp/net-b
+```
+
+After a few seconds node 1 and node 3 discover each other through node 2.
+
+### Commands
+
+| Command | Description |
+|---|---|
+| `send <dstId> <message>` | Unicast a text message to another node |
+| `mcast <groupId> <message>` | Send a multicast to a group |
+| `join <groupId> [<rootId>]` | Join a group; omit `rootId` to join as root |
+| `leave <groupId>` | Leave a group |
+| `routes` | Print the current routing table |
+| `offline` | Simulate going offline (suppresses all send and receive) |
+| `online` | Come back online |
+| `quit` / `exit` | Exit |

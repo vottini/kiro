@@ -1,4 +1,5 @@
 /build/
+/demo/build/
 /.gradle/
 /.claude/
 /.kotlin/

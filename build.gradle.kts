@@ -6,7 +6,7 @@ plugins {
 }
 
 group = "systems.untangle"
-version = "0.0.1"
+version = "0.1.1"
 
 kotlin {
     jvmToolchain(17)
@@ -53,7 +53,7 @@ mavenPublishing {
 
     pom {
         name = "Kiro"
-        description = "BATMAN routing algorithm implemented at application level"
+        description = "BATMAN routing algorithm implemented in Kotlin at application layer"
         inceptionYear = "2026"
         url = "https://github.com/vottini/kiro"
 

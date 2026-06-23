@@ -247,6 +247,13 @@ class KiroRouter(
     }
 
     // -------------------------------------------------------------------------
+    // Public API — Diagnostics
+    // -------------------------------------------------------------------------
+
+    /** Returns a snapshot of the current routing table: destination → best route. */
+    fun routes(): Map<NodeId, NeighborEntry> = neighborTable.toMap()
+
+    // -------------------------------------------------------------------------
     // Internal loops
     // -------------------------------------------------------------------------
 
@@ -414,6 +421,11 @@ class KiroRouter(
         val counter = pendingRelays.computeIfAbsent(key) { AtomicInteger(0) }
         val hearingCount = counter.incrementAndGet()
 
+        // Every node on a shared medium must update its routing table when it hears an OGM.
+        // Relay suppression (below) reduces redundant retransmissions but must not block this,
+        // or nodes that lose the hearingCount==1 race would never refresh their entries.
+        updateNeighborTable(ogm, link)
+
         // Only the first hearer schedules the relay; subsequent hearers just bump the count.
         if (hearingCount > 1) return
 
@@ -422,8 +434,6 @@ class KiroRouter(
             pendingRelays.remove(key)
             return
         }
-
-        updateNeighborTable(ogm, link)
 
         if (ogm.ttl <= 1u) {
             // TTL exhausted — do not relay, but do update the routing table.
@@ -483,15 +493,23 @@ class KiroRouter(
      * next OGM from the worse path creates a new (lower-quality) entry.
      */
     private fun updateNeighborTable(ogm: Ogm, link: Link) {
-        val current = neighborTable[ogm.originatorId]
-        if (current == null || ogm.ttl >= current.bestTtl) {
-            neighborTable[ogm.originatorId] = NeighborEntry(
-                nextHop  = ogm.senderId,
-                link     = link,
-                bestTtl  = ogm.ttl,
-                lastSeq  = ogm.seqNum,
-                lastSeen = Instant.now()
-            )
+        neighborTable.compute(ogm.originatorId) { _, current ->
+            val now = Instant.now()
+            if (current == null || ogm.ttl >= current.bestTtl) {
+                // Better or equal path: update routing info and refresh lastSeen.
+                NeighborEntry(
+                    nextHop  = ogm.senderId,
+                    link     = link,
+                    bestTtl  = ogm.ttl,
+                    lastSeq  = ogm.seqNum,
+                    lastSeen = now
+                )
+            } else {
+                // Worse path but originator is still alive: refresh lastSeen only.
+                // Without this, an entry set via a high-TTL path would expire if
+                // that path degrades and only lower-TTL OGMs are arriving.
+                current.copy(lastSeen = now)
+            }
         }
     }
 
