@@ -154,6 +154,19 @@ When the primary root goes offline, members independently select the first alter
 
 ---
 
+## Radio silence
+
+```kotlin
+router.silence()    // halt all outgoing transmissions (OGMs, beacons, data, multicast)
+router.unsilence()  // resume
+```
+
+While silent the internal protocol loops keep running and incoming frames are still processed, so the routing table stays current. The node can continue to forward other nodes' traffic — only its own transmissions are suppressed.
+
+When `unsilence()` is called the OGM and beacon loops resume at their next scheduled interval; no burst of stale frames is sent.
+
+---
+
 ## Transmit queue
 
 All outgoing frames pass through `TxQueue` — a sorted, pull-model queue shared by all link TX coroutines. Frames are dequeued by whichever link's TX loop calls `pollFor` first.
@@ -163,9 +176,8 @@ All outgoing frames pass through `TxQueue` — a sorted, pull-model queue shared
 Ordering is controlled by a composable list of `Rule` objects (each a `Comparator<TxEntry>`). The defaults are:
 
 1. `controlFirst` — OGM / BEACON before DATA / MULTICAST
-2. `userPriorityFirst` — lower `userPriority` wins (default 0; client-controlled)
-3. `olderFirst` — FIFO within a priority class
-4. `insertionOrderFirst` — strict total order tiebreaker
+2. `olderFirst` — FIFO within a priority class
+3. `insertionOrderFirst` — strict total order tiebreaker
 
 Custom rule lists can be injected into `TxQueue`:
 
@@ -196,7 +208,7 @@ handle.replace(newBytes)           // swap frame bytes, keep queue position
 handle.swap(otherHandle)           // exchange positions with another queued entry
 ```
 
-`swap` exchanges `userPriority` and `enqueuedAt` between two entries, inverting their relative order. It has no effect across flavor boundaries — a control frame always transmits before a data frame regardless of a swap.
+`swap` exchanges `enqueuedAt` between two entries, inverting their relative order. It has no effect across flavor boundaries — a control frame always transmits before a data frame regardless of a swap.
 
 ---
 
@@ -257,9 +269,57 @@ Payload lengths use a 7-bit continuation varint: lengths ≤127 cost 1 byte, ≤
 
 ---
 
+## UDP multicast link
+
+The library ships `UdpMulticastLink`, a ready-to-use [Link] implementation for JVM and Android. All nodes bound to the same multicast address and port form one broadcast domain, including nodes on different machines on the same LAN.
+
+UDP preserves datagram boundaries so no length-prefix framing is needed, and there is no risk of byte-level interleaving between concurrent writers.
+
+```kotlin
+val link = UdpMulticastLink(
+    id             = "udp:239.0.0.1:5001",
+    multicastGroup = "239.0.0.1",   // administratively scoped, stays on the LAN
+    port           = 5001,
+    ogmInterval    = 2.seconds,
+)
+link.startReading(scope)
+
+val router = KiroRouter(selfId = 1u, links = listOf(link))
+router.start(scope)
+
+// When tearing down:
+link.close()
+```
+
+Multiple instances on different ports or addresses model separate broadcast media. A node connected to two of them bridges them:
+
+```kotlin
+val linkA = UdpMulticastLink(id = "a", multicastGroup = "239.0.0.1", port = 5001)
+val linkB = UdpMulticastLink(id = "b", multicastGroup = "239.0.0.2", port = 5002)
+val router = KiroRouter(selfId = 2u, links = listOf(linkA, linkB))
+```
+
+### Frame transforms
+
+`outboundTransform` and `inboundTransform` let you pre- and post-process frames independently of the router — the typical use case is encryption. Each is a `suspend` lambda so it can call async crypto APIs. Returning `null` drops the frame silently (useful when authentication fails on the inbound side).
+
+```kotlin
+val cipher = AesGcmCipher(sharedKey)
+
+val link = UdpMulticastLink(
+    id                = "udp:239.0.0.1:5001",
+    multicastGroup    = "239.0.0.1",
+    port              = 5001,
+    outboundTransform = { frame -> cipher.encrypt(frame) },
+    inboundTransform  = { frame -> cipher.decrypt(frame) }, // returns null on auth failure
+)
+```
+
+---
+
 ## Demo CLI
 
-The `:demo` submodule ships a self-contained fat JAR that simulates a mesh over named FIFO pipes. Each **medium** is a directory; nodes on the same medium share a broadcast channel. New nodes are discovered automatically — no neighbor list required.
+The `:demo` submodule ships a self-contained fat JAR that simulates a mesh over named FIFO pipes. Each **medium** is a directory; nodes on the same medium share a broadcast channel.
 
 ### Build
 
@@ -274,11 +334,7 @@ The `:demo` submodule ships a self-contained fat JAR that simulates a mesh over 
 java -jar kiro-demo.jar <nodeId> <medium1> [<medium2> ...]
 ```
 
-Each medium path is a directory that will be created on first use. A node listening on the same directory as another node can hear its broadcasts.
-
-### Example topology
-
-Three nodes sharing two overlapping media:
+Each medium path is a directory that will be created on first use. A node on the same directory as another node can hear its broadcasts.
 
 ```sh
 # Terminal 1 — node 1 on net-a only

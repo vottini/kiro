@@ -31,7 +31,7 @@ enum class PacketFlavor {
  * concern. Rules are composed in priority order by [TxQueue]: the first rule
  * that returns a non-zero comparison wins; later rules act as tiebreakers.
  *
- * Built-in rules: [controlFirst], [userPriorityFirst], [olderFirst], [insertionOrderFirst].
+ * Built-in rules: [controlFirst], [olderFirst], [insertionOrderFirst].
  */
 typealias Rule = Comparator<TxEntry>
 
@@ -40,13 +40,6 @@ typealias Rule = Comparator<TxEntry>
  * (DATA, MULTICAST) so that routing state stays fresh under congestion.
  */
 val controlFirst: Rule = compareBy { if (it.flavor.isControl) 0 else 1 }
-
-/**
- * Client-controlled ordering layer. Lower [TxEntry.userPriority] values are
- * transmitted first. The default value is 0, so entries are unaffected unless
- * the caller explicitly sets [TxEntry.userPriority] or calls [TxHandle.swap].
- */
-val userPriorityFirst: Rule = compareBy { it.userPriority }
 
 /**
  * Among entries with the same effective priority, older frames are sent first,
@@ -63,9 +56,9 @@ val insertionOrderFirst: Rule = compareBy { it.insertionOrder }
 
 /**
  * The default rule list applied when no custom rules are supplied to [TxQueue].
- * Applies: control before data → client priority → older before newer → insertion order.
+ * Applies: control before data → older before newer → insertion order.
  */
-fun defaultRules(): List<Rule> = listOf(controlFirst, userPriorityFirst, olderFirst, insertionOrderFirst)
+fun defaultRules(): List<Rule> = listOf(controlFirst, olderFirst, insertionOrderFirst)
 
 /**
  * Global monotonically increasing counter that assigns a unique insertion order
@@ -85,10 +78,8 @@ private val insertionCounter = AtomicLong(0)
  * @property flavor Describes the kind of frame, used by [Rule]s to determine
  *   ordering relative to other entries in the queue.
  * @property enqueuedAt Wall-clock time of enqueue, used by [olderFirst].
+ *   Can be supplied explicitly to control ordering (e.g. in tests).
  * @property insertionOrder Globally unique tie-breaker, used by [insertionOrderFirst].
- * @property userPriority Client-controlled ordering weight used by [userPriorityFirst].
- *   Lower values are transmitted first; default 0 preserves standard ordering.
- *   Mutated indirectly via [TxHandle.swap].
  */
 data class TxEntry(
     val frame: ByteArray,
@@ -96,7 +87,6 @@ data class TxEntry(
     val flavor: PacketFlavor,
     val enqueuedAt: Instant = Instant.now(),
     val insertionOrder: Long = insertionCounter.getAndIncrement(),
-    val userPriority: Int = 0
 ) {
     // Identity is defined solely by insertionOrder — each TxEntry is unique.
     override fun equals(other: Any?): Boolean {
@@ -160,10 +150,10 @@ class TxHandle internal constructor(
 
     /**
      * Swaps this entry's queue position with [other] by exchanging their
-     * [TxEntry.userPriority] and [TxEntry.enqueuedAt] ordering keys. After the
-     * call, this entry occupies [other]'s former position and vice versa.
+     * [TxEntry.enqueuedAt] ordering keys. After the call, this entry occupies
+     * [other]'s former position and vice versa.
      *
-     * Note: [controlFirst] is always applied before the swapped keys, so a
+     * Note: [controlFirst] is always applied before enqueue time, so a
      * control frame and a data frame cannot exchange positions this way.
      *
      * Returns `false` if either entry was already transmitted.
@@ -189,7 +179,7 @@ class TxHandle internal constructor(
  * [Comparator]. Rules are applied in list order; the first rule that returns
  * a non-zero result determines the relative position of two entries. The
  * default rule list ([defaultRules]) places control frames before data frames,
- * then applies client priority, then breaks ties by enqueue time and insertion order.
+ * then breaks ties by enqueue time and insertion order.
  *
  * ## Eligible-link work stealing
  *
@@ -322,16 +312,16 @@ class TxQueue(rules: List<Rule> = defaultRules()) {
 
     /**
      * Swaps the queue positions of the entries referenced by [h1] and [h2] by
-     * exchanging their [TxEntry.userPriority] and [TxEntry.enqueuedAt] ordering
-     * keys. Returns `false` if either entry was already transmitted.
+     * exchanging their [TxEntry.enqueuedAt] ordering keys.
+     * Returns `false` if either entry was already transmitted.
      */
     internal suspend fun swap(h1: TxHandle, h2: TxHandle): Boolean = mutex.withLock {
         val e1 = entryIndex[h1.id] ?: return@withLock false
         val e2 = entryIndex[h2.id] ?: return@withLock false
         entries.remove(e1)
         entries.remove(e2)
-        val e1new = e1.copy(userPriority = e2.userPriority, enqueuedAt = e2.enqueuedAt)
-        val e2new = e2.copy(userPriority = e1.userPriority, enqueuedAt = e1.enqueuedAt)
+        val e1new = e1.copy(enqueuedAt = e2.enqueuedAt)
+        val e2new = e2.copy(enqueuedAt = e1.enqueuedAt)
         entries.add(e1new)
         entries.add(e2new)
         entryIndex[h1.id] = e1new

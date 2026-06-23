@@ -135,6 +135,8 @@ class KiroRouter(
     /** Stored on [start] so that [joinGroup] can launch beacon coroutines after startup. */
     private lateinit var scope: CoroutineScope
 
+    @Volatile private var silent = false
+
     // -------------------------------------------------------------------------
     // Lifecycle
     // -------------------------------------------------------------------------
@@ -254,6 +256,28 @@ class KiroRouter(
     fun routes(): Map<NodeId, NeighborEntry> = neighborTable.toMap()
 
     // -------------------------------------------------------------------------
+    // Public API — Radio silence
+    // -------------------------------------------------------------------------
+
+    /**
+     * Halts all outgoing transmissions on every link — OGMs, beacons, unicast and
+     * multicast data — without stopping the internal protocol loops. Received frames
+     * are still processed and the routing table is still maintained while silent, so
+     * the node can continue to act as a passive relay for other nodes' traffic.
+     *
+     * Call [unsilence] to resume transmitting.
+     */
+    fun silence() { silent = true }
+
+    /**
+     * Resumes outgoing transmissions after a call to [silence].
+     * OGM and beacon loops are already running and will enqueue their next frames
+     * at the next scheduled interval, so routing presence is re-established within
+     * one OGM cycle.
+     */
+    fun unsilence() { silent = false }
+
+    // -------------------------------------------------------------------------
     // Internal loops
     // -------------------------------------------------------------------------
 
@@ -280,7 +304,7 @@ class KiroRouter(
     private suspend fun txLoop(link: Link) {
         while (true) {
             val entry = txQueue.pollFor(link)
-            link.broadcast(entry.frame)
+            if (!silent) link.broadcast(entry.frame)
         }
     }
 

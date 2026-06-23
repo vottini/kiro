@@ -129,11 +129,13 @@ private suspend fun handleCommand(
 
         "offline" -> {
             links.forEach { it.online = false }
+            router.silence()
             println("offline — all media suppressed")
         }
 
         "online" -> {
             links.forEach { it.online = true }
+            router.unsilence()
             println("online")
         }
 

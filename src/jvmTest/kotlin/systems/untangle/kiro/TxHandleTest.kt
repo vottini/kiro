@@ -6,6 +6,7 @@ import kotlinx.coroutines.flow.emptyFlow
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.test.runTest
 import kotlinx.coroutines.yield
+import java.time.Instant
 import kotlin.test.Test
 import kotlin.test.assertEquals
 import kotlin.test.assertFalse
@@ -29,12 +30,12 @@ class TxHandleTest {
         link: Link,
         flavor: PacketFlavor,
         payload: Byte = 0,
-        userPriority: Int = 0
+        enqueuedAt: Instant = Instant.now()
     ) = TxEntry(
         frame = byteArrayOf(payload),
         eligibleLinks = setOf(link),
         flavor = flavor,
-        userPriority = userPriority
+        enqueuedAt = enqueuedAt
     )
 
     // ── handle identity ───────────────────────────────────────────────────────
@@ -181,11 +182,10 @@ class TxHandleTest {
 
     @Test fun `replace preserves queue position`() = runTest {
         val q = TxQueue()
-        val h1 = q.enqueue(entry(linkA, PacketFlavor.DATA, payload = 1, userPriority = 0))
-        val h2 = q.enqueue(entry(linkA, PacketFlavor.DATA, payload = 2, userPriority = 1))
-        // h1 has lower userPriority (comes first); replace its bytes
+        // h1 is older so it comes first; replace its bytes and verify position is unchanged
+        val h1 = q.enqueue(entry(linkA, PacketFlavor.DATA, payload = 1, enqueuedAt = Instant.ofEpochMilli(1)))
+        val h2 = q.enqueue(entry(linkA, PacketFlavor.DATA, payload = 2, enqueuedAt = Instant.ofEpochMilli(2)))
         h1.replace(byteArrayOf(99))
-        // h1 should still come first (position unchanged)
         val first  = q.pollFor(linkA)
         val second = q.pollFor(linkA)
         assertEquals(h1.id, first.insertionOrder)
@@ -204,37 +204,36 @@ class TxHandleTest {
 
     @Test fun `swap inverts transmission order of two queued entries`() = runTest {
         val q = TxQueue()
-        // Different userPriority so ordering is deterministic regardless of enqueuedAt resolution.
-        val h1 = q.enqueue(entry(linkA, PacketFlavor.DATA, payload = 1, userPriority = 0))
-        val h2 = q.enqueue(entry(linkA, PacketFlavor.DATA, payload = 2, userPriority = 1))
-        // Before swap: h1 first (userPriority 0 < 1)
+        // h1 is older so it comes first; after swap h2 should come first
+        val h1 = q.enqueue(entry(linkA, PacketFlavor.DATA, payload = 1, enqueuedAt = Instant.ofEpochMilli(1)))
+        val h2 = q.enqueue(entry(linkA, PacketFlavor.DATA, payload = 2, enqueuedAt = Instant.ofEpochMilli(2)))
         assertTrue(h1.swap(h2))
-        // After swap: h2 first (now has userPriority 0)
         assertEquals(2.toByte(), q.pollFor(linkA).frame[0])
         assertEquals(1.toByte(), q.pollFor(linkA).frame[0])
     }
 
     @Test fun `swap returns false when first entry was already transmitted`() = runTest {
         val q = TxQueue()
-        val h1 = q.enqueue(entry(linkA, PacketFlavor.DATA, payload = 1, userPriority = 0))
-        val h2 = q.enqueue(entry(linkA, PacketFlavor.DATA, payload = 2, userPriority = 1))
-        q.pollFor(linkA)    // transmits h1
+        val h1 = q.enqueue(entry(linkA, PacketFlavor.DATA, payload = 1, enqueuedAt = Instant.ofEpochMilli(1)))
+        val h2 = q.enqueue(entry(linkA, PacketFlavor.DATA, payload = 2, enqueuedAt = Instant.ofEpochMilli(2)))
+        q.pollFor(linkA)    // transmits h1 (older)
         assertFalse(h1.swap(h2))
     }
 
     @Test fun `swap returns false when second entry was already transmitted`() = runTest {
         val q = TxQueue()
-        val h1 = q.enqueue(entry(linkA, PacketFlavor.DATA, payload = 1, userPriority = 1))
-        val h2 = q.enqueue(entry(linkA, PacketFlavor.DATA, payload = 2, userPriority = 0))
-        q.pollFor(linkA)    // transmits h2 (lower userPriority = higher priority)
+        // h2 is older so it comes first and is transmitted by pollFor
+        val h1 = q.enqueue(entry(linkA, PacketFlavor.DATA, payload = 1, enqueuedAt = Instant.ofEpochMilli(2)))
+        val h2 = q.enqueue(entry(linkA, PacketFlavor.DATA, payload = 2, enqueuedAt = Instant.ofEpochMilli(1)))
+        q.pollFor(linkA)    // transmits h2 (older)
         assertFalse(h1.swap(h2))
     }
 
     @Test fun `swap does not override controlFirst — control stays ahead of data`() = runTest {
         val q = TxQueue()
-        val hData    = q.enqueue(entry(linkA, PacketFlavor.DATA,    payload = 1, userPriority = 0))
-        val hControl = q.enqueue(entry(linkA, PacketFlavor.OGM,     payload = 2, userPriority = 1))
-        // Swap gives data the control's userPriority and vice versa; controlFirst still wins.
+        val hData    = q.enqueue(entry(linkA, PacketFlavor.DATA, payload = 1, enqueuedAt = Instant.ofEpochMilli(1)))
+        val hControl = q.enqueue(entry(linkA, PacketFlavor.OGM,  payload = 2, enqueuedAt = Instant.ofEpochMilli(2)))
+        // Swap exchanges enqueuedAt; controlFirst still wins regardless
         hData.swap(hControl)
         assertEquals(2.toByte(), q.pollFor(linkA).frame[0])   // OGM still first
         assertEquals(1.toByte(), q.pollFor(linkA).frame[0])
@@ -242,8 +241,8 @@ class TxHandleTest {
 
     @Test fun `double swap restores original order`() = runTest {
         val q = TxQueue()
-        val h1 = q.enqueue(entry(linkA, PacketFlavor.DATA, payload = 1, userPriority = 0))
-        val h2 = q.enqueue(entry(linkA, PacketFlavor.DATA, payload = 2, userPriority = 1))
+        val h1 = q.enqueue(entry(linkA, PacketFlavor.DATA, payload = 1, enqueuedAt = Instant.ofEpochMilli(1)))
+        val h2 = q.enqueue(entry(linkA, PacketFlavor.DATA, payload = 2, enqueuedAt = Instant.ofEpochMilli(2)))
         h1.swap(h2)
         h1.swap(h2)    // swap back
         assertEquals(1.toByte(), q.pollFor(linkA).frame[0])
