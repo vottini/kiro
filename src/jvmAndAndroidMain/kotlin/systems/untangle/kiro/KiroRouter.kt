@@ -508,37 +508,37 @@ class KiroRouter(
     /**
      * Updates [neighborTable] when an OGM from [ogm.originatorId] is received.
      *
-     * The route is replaced whenever [ogm.ttl] is at least as good as the current
-     * best (≥ rather than strictly >). This has two effects:
+     * Three cases:
      *
-     *  1. **Liveness**: a stable topology keeps re-electing the same or an equivalent
-     *     sender each cycle, so [lastSeen] is refreshed and the entry never goes stale.
-     *  2. **Fast rerouting**: when two equal-quality paths exist and one disappears,
-     *     the surviving path's OGMs naturally take over on the next cycle without
-     *     waiting for the stale entry to expire.
+     *  1. **Better or equal path** (`ogm.ttl >= bestTtl`): replace the entry. Equal-TTL
+     *     OGMs keep re-electing the same or an equivalent sender each cycle, so
+     *     [lastSeen] is refreshed and the entry never goes stale under a stable topology.
      *
-     * OGMs arriving via a strictly worse path (lower TTL) are ignored. If the
-     * current best path fails and only a worse path remains, the entry expires
-     * naturally after [neighborPurgeMultiplier] × [Link.ogmInterval], and the
-     * next OGM from the worse path creates a new (lower-quality) entry.
+     *  2. **Worse path, same next hop and link** (`ogm.ttl < bestTtl`, same sender):
+     *     The originator is still reachable via the recorded next hop but at temporarily
+     *     degraded quality (e.g. an intermediate relay was suppressed). Refresh [lastSeen]
+     *     only — keep the better TTL, keep the next hop alive.
+     *
+     *  3. **Worse path, different next hop or link**: A lower-quality alternative route
+     *     exists, but it gives no evidence that the current next hop is still forwarding.
+     *     Leave the entry unchanged. If the current next hop has gone silent, the entry
+     *     will expire naturally after [neighborPurgeMultiplier] × [Link.ogmInterval] and
+     *     the next OGM from the alternative path will install a fresh (lower-quality) entry.
      */
     private fun updateNeighborTable(ogm: Ogm, link: Link) {
         neighborTable.compute(ogm.originatorId) { _, current ->
             val now = Instant.now()
-            if (current == null || ogm.ttl >= current.bestTtl) {
-                // Better or equal path: update routing info and refresh lastSeen.
-                NeighborEntry(
+            when {
+                current == null || ogm.ttl >= current.bestTtl -> NeighborEntry(
                     nextHop  = ogm.senderId,
                     link     = link,
                     bestTtl  = ogm.ttl,
                     lastSeq  = ogm.seqNum,
                     lastSeen = now
                 )
-            } else {
-                // Worse path but originator is still alive: refresh lastSeen only.
-                // Without this, an entry set via a high-TTL path would expire if
-                // that path degrades and only lower-TTL OGMs are arriving.
-                current.copy(lastSeen = now)
+                ogm.senderId == current.nextHop && link.id == current.link.id ->
+                    current.copy(lastSeen = now)
+                else -> current
             }
         }
     }
