@@ -6,7 +6,7 @@ plugins {
 }
 
 group = "systems.untangle"
-version = "0.1.2"
+version = "0.2.0"
 
 kotlin {
     jvmToolchain(17)

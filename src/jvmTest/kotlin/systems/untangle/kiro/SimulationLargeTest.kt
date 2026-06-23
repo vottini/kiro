@@ -38,14 +38,24 @@ class SimulationLargeTest {
     private fun lnk(id: String, med: SimMedium) = simLink(id, med, OGM_INTERVAL)
 
     private val nodeById = mutableMapOf<Int, KiroRouter>()
+    private data class NodeCfg(val selfId: NodeId, val links: List<Link>)
+    private val nodeCfg  = mutableMapOf<KiroRouter, NodeCfg>()
 
-    private fun node(id: Int, vararg links: Link) =
-        KiroRouter(selfId = id.toUShort(), links = links.toList(),
-            staleThreshold = STALE, neighborPurgeMultiplier = PURGE_MULT).also { nodeById[id] = it }
+    private fun node(id: Int, vararg links: Link): KiroRouter {
+        val router = KiroRouter()
+        nodeCfg[router] = NodeCfg(id.toUShort(), links.toList())
+        nodeById[id] = router
+        return router
+    }
+
+    private fun KiroRouter.startIn(scope: CoroutineScope) {
+        val cfg = nodeCfg[this]!!
+        start(scope, cfg.selfId, cfg.links, staleThreshold = STALE, neighborPurgeMultiplier = PURGE_MULT)
+    }
 
     private fun CoroutineScope.startKillable(n: KiroRouter): CompletableJob {
         val job = SupervisorJob(coroutineContext[Job])
-        n.start(CoroutineScope(coroutineContext + job))
+        n.startIn(CoroutineScope(coroutineContext + job))
         return job
     }
 
@@ -134,7 +144,7 @@ class SimulationLargeTest {
         }
 
         val c1Job = startKillable(c1)
-        (listOf(c2) + dist.toList() + access.flatMap { it.toList() }).forEach { it.start(this) }
+        (listOf(c2) + dist.toList() + access.flatMap { it.toList() }).forEach { it.startIn(this) }
         delay(OGM_LARGE)   // 5-hop hierarchy needs full convergence window
 
         // ── Baseline: A1(11) → A32(42) via core ──
@@ -202,7 +212,7 @@ class SimulationLargeTest {
 
         // Nodes 10–13 (0-indexed: 9–12) will be killed
         val killJobs = (9..12).map { startKillable(nodes[it]) }
-        nodes.filterIndexed { i, _ -> i !in 9..12 }.forEach { it.start(this) }
+        nodes.filterIndexed { i, _ -> i !in 9..12 }.forEach { it.startIn(this) }
         delay(OGM_XLARGE)  // chord ring; 7-hop diameter with 160+ coroutines
         delay(OGM_XLARGE)  // extra window: in the full suite, 640+ coroutines slow actual OGM delivery 3-4×
 
@@ -295,7 +305,7 @@ class SimulationLargeTest {
         // leaf 2 bridges S1↔S3, leaf 3 bridges S3↔S0=S4, etc.
         val sKillJob = startKillable(spines[1])
         (spines.filterIndexed { i, _ -> i != 1 } + leaves.toList() + hosts.flatMap { it.toList() })
-            .forEach { it.start(this) }
+            .forEach { it.startIn(this) }
         delay(OGM_LARGE)
 
         // ── Baseline H1(17)→H24(40): 4 hops via any spine ──
@@ -380,7 +390,7 @@ class SimulationLargeTest {
         }
 
         val hubJob = startKillable(hub)
-        (secs.toList() + leaves.flatMap { it.toList() }).forEach { it.start(this) }
+        (secs.toList() + leaves.flatMap { it.toList() }).forEach { it.startIn(this) }
         delay(OGM_LARGE)
 
         // ── Baseline: L1(10)→L32(41) via hub ──
@@ -482,7 +492,7 @@ class SimulationLargeTest {
 
         val b1Job = startKillable(bridge1)
         (gridA.flatMap { it.toList() } + gridB.flatMap { it.toList() } + listOf(bridge2))
-            .forEach { it.start(this) }
+            .forEach { it.startIn(this) }
         delay(OGM_LARGE)   // up to 14-hop paths between grids
 
         fun a(r: Int, c: Int) = gridA[r][c]
@@ -549,7 +559,7 @@ class SimulationLargeTest {
         }
 
         val killJobs = (2..4).map { startKillable(aggs[it]) }  // agg 3,4,5 (0-indexed 2,3,4)
-        (aggs.filterIndexed { i, _ -> i !in 2..4 } + accessNodes.toList()).forEach { it.start(this) }
+        (aggs.filterIndexed { i, _ -> i !in 2..4 } + accessNodes.toList()).forEach { it.startIn(this) }
         delay(OGM_XLARGE)  // 10-hop agg ring; full convergence needed before baseline test
         delay(OGM_LARGE)   // extra window: 30 access nodes × 8-link agg nodes = high scheduler load
 
@@ -614,7 +624,7 @@ class SimulationLargeTest {
         val k2Job = startKillable(n(21))
         val k3Job = startKillable(n(28))
         grid.forEach { row -> row.forEach { node ->
-            if (node !== n(14) && node !== n(21) && node !== n(28)) node.start(this)
+            if (node !== n(14) && node !== n(21) && node !== n(28)) node.startIn(this)
         } }
         delay(OGM_LARGE)
 
@@ -670,7 +680,7 @@ class SimulationLargeTest {
         fun n(id: Int) = grid[(id - 1) / COLS][(id - 1) % COLS]
 
         val relayJob = startKillable(n(21))
-        grid.forEach { row -> row.forEach { nd -> if (nd !== n(21)) nd.start(this) } }
+        grid.forEach { row -> row.forEach { nd -> if (nd !== n(21)) nd.startIn(this) } }
         delay(OGM_LARGE)
 
         val g1 = GroupId(171u); val g1Root = n(1).selfId
@@ -770,7 +780,7 @@ class SimulationLargeTest {
 
         val killRange = KILL_SEG * PER_SEG until (KILL_SEG + 1) * PER_SEG  // indices 15..19
         val killJobs = killRange.map { startKillable(nodes[it]) }
-        nodes.filterIndexed { i, _ -> i !in killRange }.forEach { it.start(this) }
+        nodes.filterIndexed { i, _ -> i !in killRange }.forEach { it.startIn(this) }
         delay(OGM_XLARGE)  // 13-hop chain; needs extended convergence window
 
         // ── Baseline: node 1 → node 40 ──
@@ -852,7 +862,7 @@ class SimulationLargeTest {
         // Kill backbone 3 and 4 (0-indexed: 2 and 3)
         val bk3Job = startKillable(backbone[2]); val bk4Job = startKillable(backbone[3])
         (backbone.filterIndexed { i, _ -> i !in setOf(2, 3) } +
-            inner.toList() + leaves.flatMap { it.toList() }).forEach { it.start(this) }
+            inner.toList() + leaves.flatMap { it.toList() }).forEach { it.startIn(this) }
         delay(OGM_LARGE)
 
         // leaf[2][0] (id = 16+6+0+1=23) is near dead backbone 3
@@ -951,7 +961,7 @@ class SimulationLargeTest {
 
         val startNodes = backbone.toList() + access.toList() -
             setOf(bb(3), bb(5), bb(7), access[8], access[19])
-        startNodes.forEach { it.start(this) }
+        startNodes.forEach { it.startIn(this) }
         delay(OGM_LARGE)
 
         // Build two multicast groups.

@@ -68,10 +68,20 @@ class SimulationTest {
     private val SUB_DELAY  = 100.milliseconds
 
     private val nodeById = mutableMapOf<Int, KiroRouter>()
+    private data class NodeCfg(val selfId: NodeId, val links: List<Link>)
+    private val nodeCfg  = mutableMapOf<KiroRouter, NodeCfg>()
 
-    private fun node(id: UShort, vararg links: Link) =
-        KiroRouter(selfId = id.toUShort(), links = links.toList(), staleThreshold = STALE,
-            neighborPurgeMultiplier = 5).also { nodeById[id.toInt()] = it }
+    private fun node(id: UShort, vararg links: Link): KiroRouter {
+        val router = KiroRouter()
+        nodeCfg[router] = NodeCfg(id, links.toList())
+        nodeById[id.toInt()] = router
+        return router
+    }
+
+    private fun KiroRouter.startIn(scope: CoroutineScope) {
+        val cfg = nodeCfg[this]!!
+        start(scope, cfg.selfId, cfg.links, staleThreshold = STALE, neighborPurgeMultiplier = 5)
+    }
 
     /**
      * Starts [node] under a child [SupervisorJob] so it can be killed independently
@@ -79,7 +89,7 @@ class SimulationTest {
      */
     private fun CoroutineScope.startKillable(node: KiroRouter): CompletableJob {
         val job = SupervisorJob(coroutineContext[Job])
-        node.start(CoroutineScope(coroutineContext + job))
+        node.startIn(CoroutineScope(coroutineContext + job))
         return job
     }
 
@@ -120,7 +130,7 @@ class SimulationTest {
         val b  = node(2u, simLink("B-1", m1), simLink("B-2", m2))
         val c  = node(3u, simLink("C-2", m2))
 
-        a.start(this); b.start(this); c.start(this)
+        a.startIn(this); b.startIn(this); c.startIn(this)
         delay(OGM_CONV)   // A↔B↔C routes established
 
         // ── Unicast A → C ──
@@ -171,7 +181,7 @@ class SimulationTest {
         val e  = node(5u, simLink("E-2", m2))
         val f  = node(6u, simLink("F-2", m2))
 
-        listOf(a, b, c, d, e, f).forEach { it.start(this) }
+        listOf(a, b, c, d, e, f).forEach { it.startIn(this) }
         delay(OGM_CONV + 100.milliseconds)   // 3-hop OGMs need one extra cycle
 
         // ── Unicast A → F (3 hops: A→B→D→F) ──
@@ -237,7 +247,7 @@ class SimulationTest {
         val b = node(3u, simLink("B-R", mRB, 100.milliseconds))
         val c = node(4u, simLink("C-A", mAC, 100.milliseconds))
 
-        listOf(r, a, b, c).forEach { it.start(this) }
+        listOf(r, a, b, c).forEach { it.startIn(this) }
         delay(OGM_CONV)   // R learns C via A; R learns B direct
 
         // ── Unicast R→C (2-hop via A) ──
@@ -293,7 +303,7 @@ class SimulationTest {
                 simLink("$i-L", media[(i - 2 + 10) % 10]),
                 simLink("$i-R", media[(i - 1) % 10]))
         }
-        nodes.forEach { it.start(this) }
+        nodes.forEach { it.startIn(this) }
         delay(OGM_CONV + 250.milliseconds)   // ring diameter = 5 hops; extra propagation time
 
         // ── Unicast 1→4 (3 hops clockwise: 1→2→3→4) ──
@@ -374,7 +384,7 @@ class SimulationTest {
         val n15 = node(15u, simLink("15-7", e715))
 
         listOf(n1, n2, n3, n4, n5, n6, n7, n8, n9, n10, n11, n12, n13, n14, n15)
-            .forEach { it.start(this) }
+            .forEach { it.startIn(this) }
         delay(OGM_CONV + 300.milliseconds)   // 6-hop leaf-to-leaf diameter; extra propagation time
 
         // ── Unicast root→leaf: 1→8 (3 hops: 1→2→4→8) ──
@@ -453,7 +463,7 @@ class SimulationTest {
                 node(nodeId(r, c), *links.toTypedArray())
             }
         }
-        grid.forEach { row -> row.forEach { it.start(this) } }
+        grid.forEach { row -> row.forEach { it.startIn(this) } }
         delay(OGM_CONV + 500.milliseconds)   // 6-hop diameter; generous convergence window
 
         fun n(id: Int) = grid[(id - 1) / N][(id - 1) % N]
@@ -519,7 +529,7 @@ class SimulationTest {
         val d = node(4u, simLink("D-B", mBD), simLink("D-C", mCD))
 
         val bJob = startKillable(b)
-        listOf(a, c, d).forEach { it.start(this) }
+        listOf(a, c, d).forEach { it.startIn(this) }
         delay(OGM_CONV)
 
         // ── Baseline: A→D works (2 hops, via B or C) ──
@@ -559,7 +569,7 @@ class SimulationTest {
         val e = node(5u, simLink("E-R", mR))
 
         val bJob = startKillable(b)
-        listOf(a, c, d, e).forEach { it.start(this) }
+        listOf(a, c, d, e).forEach { it.startIn(this) }
         delay(OGM_CONV + 100.milliseconds)
 
         // ── Baseline: A→E works through B ──
@@ -613,7 +623,7 @@ class SimulationTest {
         val m  = node(4u, simLink("M-R1",  mR1M), simLink("M-R2",  mR2M))
 
         val r1Job = startKillable(r1)
-        listOf(s, r2, m).forEach { it.start(this) }
+        listOf(s, r2, m).forEach { it.startIn(this) }
         delay(OGM_CONV)
 
         val gid = GroupId(9u)

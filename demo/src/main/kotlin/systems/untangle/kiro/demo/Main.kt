@@ -44,7 +44,7 @@ fun main(args: Array<String>) {
         ).also { it.initialize() }
     }
 
-    val router = KiroRouter(selfId = selfId, links = links)
+    val router = KiroRouter()
 
     println("=== kiro node $selfId ===")
     mediums.forEach { println("  medium: $it") }
@@ -52,7 +52,7 @@ fun main(args: Array<String>) {
 
     runBlocking {
         links.forEach { it.startReading(this) }
-        router.start(this)
+        router.start(this, selfId = selfId, links = links)
 
         launch {
             router.incomingData.collect { (srcId, payload) ->
@@ -117,7 +117,7 @@ private suspend fun handleCommand(
         }
 
         "routes" -> {
-            val routes = router.routes()
+            val routes = router.routes.value
             if (routes.isEmpty()) println("(no routes yet)")
             else routes.entries
                 .sortedBy { it.key.toInt() }

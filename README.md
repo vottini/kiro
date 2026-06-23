@@ -47,8 +47,8 @@ val radio: Link = object : Link {
 }
 
 // 2. Create a router and start it inside a CoroutineScope.
-val router = KiroRouter(selfId = 0x001u, links = listOf(radio))
-router.start(scope)
+val router = KiroRouter()
+router.start(scope, selfId = 0x001u, links = listOf(radio))
 
 // 3. Send unicast data to another node.
 router.send(dstId = 0x002u, payload = "hello".encodeToByteArray())
@@ -87,7 +87,9 @@ interface Link {
 One instance per node. Orchestrates OGM emission, relay suppression, route table maintenance, multicast tree building, and frame forwarding.
 
 ```kotlin
-KiroRouter(
+val router = KiroRouter()
+router.start(
+    scope: CoroutineScope,
     selfId: NodeId,
     links: List<Link>,
     txQueue: TxQueue = TxQueue(),
@@ -101,7 +103,7 @@ KiroRouter(
 | `staleThreshold` | How long a multicast branch is kept without a refreshing beacon before eviction |
 | `neighborPurgeMultiplier` | Route is evicted after this many missed OGM cycles on its link |
 
-Call `router.start(scope)` once before using any other method. All protocol loops are launched inside the given scope and cancelled when it is cancelled.
+Call `router.start(scope, selfId, links)` before using any other method. All protocol loops run inside a child scope derived from `scope` — cancelling `scope` also stops the router, but `router.stop()` stops it independently without affecting `scope`. Calling `start` again after `stop` resets all internal state so the node restarts clean.
 
 ---
 
@@ -116,6 +118,18 @@ router.incomingData.collect { (srcId, payload) -> ... }
 ```
 
 `send` looks up the best next hop in the routing table and enqueues a `DataFrame`. If no route is known the frame is silently dropped. Forwarding nodes decrement TTL (initial value 15) and drop frames that reach zero.
+
+### Routing table
+
+```kotlin
+// Current snapshot
+val table: Map<NodeId, NeighborEntry> = router.routes.value
+
+// Live updates — emits a new snapshot on every add, update, or eviction
+router.routes.collect { table -> println(table) }
+```
+
+`routes` is a `StateFlow` so it always holds the latest snapshot; new collectors receive it immediately without waiting for the next change. The flow is reset to an empty map on each `start` call, so collectors do not need to resubscribe after a restart.
 
 ---
 
@@ -288,8 +302,8 @@ val link = UdpMulticastLink(
 )
 link.startReading(scope)
 
-val router = KiroRouter(selfId = 1u, links = listOf(link))
-router.start(scope)
+val router = KiroRouter()
+router.start(scope, selfId = 1u, links = listOf(link))
 
 // When tearing down:
 link.close()
@@ -300,7 +314,8 @@ Multiple instances on different ports or addresses model separate broadcast medi
 ```kotlin
 val linkA = UdpMulticastLink(id = "a", multicastGroup = "239.0.0.1", port = 5001)
 val linkB = UdpMulticastLink(id = "b", multicastGroup = "239.0.0.2", port = 5002)
-val router = KiroRouter(selfId = 2u, links = listOf(linkA, linkB))
+val router = KiroRouter()
+router.start(scope, selfId = 2u, links = listOf(linkA, linkB))
 ```
 
 ### Frame transforms

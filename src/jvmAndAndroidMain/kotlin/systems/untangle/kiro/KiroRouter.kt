@@ -1,9 +1,13 @@
 package systems.untangle.kiro
 
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableSharedFlow
+import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.SharedFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.launch
 import java.time.Instant
 import java.util.concurrent.ConcurrentHashMap
@@ -63,33 +67,29 @@ data class MulticastMessage(val srcId: NodeId, val groupId: GroupId, val payload
  * ([neighborTable], [pendingRelays], [multicastTree]) uses [ConcurrentHashMap]
  * and [AtomicInteger] to avoid explicit locking.
  *
- * @param selfId This node's unique identifier within the mesh.
- * @param links All radio interfaces available to this node.
- * @param txQueue Central transmit queue; injectable for testing.
- * @param staleThreshold How long without a beacon refresh before a multicast tree
- *   branch is considered dead and evicted. Should be at least 3× the beacon interval.
- * @param neighborPurgeMultiplier How many missed OGM cycles before a neighbour table
- *   entry is considered unreachable and removed. A node that has been silent for
- *   [neighborPurgeMultiplier] × [Link.ogmInterval] is presumed gone. Default 3 matches
- *   batman-adv's own originator timeout heuristic.
  */
-class KiroRouter(
-    val selfId: NodeId,
-    val links: List<Link>,
-    val txQueue: TxQueue = TxQueue(),
-    val staleThreshold: Duration = 90.seconds,
-    val neighborPurgeMultiplier: Int = 3
-) {
+class KiroRouter {
+
+    var selfId: NodeId = 0u
+        private set
+    var links: List<Link> = emptyList()
+        private set
+    var txQueue: TxQueue = TxQueue()
+        private set
+    var staleThreshold: Duration = 90.seconds
+        private set
+    var neighborPurgeMultiplier: Int = 3
+        private set
     // --- Unicast routing state ---
 
     /** Next-hop routing table: originator NodeId → best known route entry. */
-    private val neighborTable = ConcurrentHashMap<NodeId, NeighborEntry>()
+    private var neighborTable = ConcurrentHashMap<NodeId, NeighborEntry>()
 
     /** Deduplicates OGMs so each (originator, seq) is processed and relayed at most once. */
-    private val seenOgms = SeenWindowCache()
+    private var seenOgms = SeenWindowCache()
 
     /** Global OGM sequence counter shared across all links on this node. */
-    private val ogmSeq = AtomicInteger(0)
+    private var ogmSeq = AtomicInteger(0)
 
     /**
      * Tracks how many times each pending OGM relay has been heard during its jitter window.
@@ -97,30 +97,30 @@ class KiroRouter(
      * Entries are created when the first copy of an OGM arrives and removed when
      * the jitter timer fires and the relay decision is made.
      */
-    private val pendingRelays = ConcurrentHashMap<Pair<NodeId, UShort>, AtomicInteger>()
+    private var pendingRelays = ConcurrentHashMap<Pair<NodeId, UShort>, AtomicInteger>()
 
     // --- Multicast state ---
 
     /** Spanning tree of links per group, built from beacon relay observations. */
-    private val multicastTree = MulticastTree()
+    private var multicastTree = MulticastTree()
 
     /** Deduplicates multicast frames so each (srcId, seqNum) is delivered/relayed once. */
-    private val seenMulticasts = SeenWindowCache()
+    private var seenMulticasts = SeenWindowCache()
 
     /** Per-node multicast sequence counter for frames originated by this node. */
-    private val multicastSeq = AtomicInteger(0)
+    private var multicastSeq = AtomicInteger(0)
 
     // --- Group membership ---
 
     /** Set of [GroupId]s this node belongs to. */
-    private val localGroups = ConcurrentHashMap.newKeySet<GroupId>()
+    private var localGroups = ConcurrentHashMap.newKeySet<GroupId>()
 
     /**
      * Ordered root candidates per group, stored when this node joins a group.
      * [beaconLoop] sends beacons toward the first root that has a known route in
      * [neighborTable].
      */
-    private val groupRoots = ConcurrentHashMap<GroupId, List<NodeId>>()
+    private var groupRoots = ConcurrentHashMap<GroupId, List<NodeId>>()
 
     // --- Public flows ---
 
@@ -132,8 +132,17 @@ class KiroRouter(
     /** Emits a [MulticastMessage] whenever a group multicast arrives and this node is a member. */
     val incomingMulticast: SharedFlow<MulticastMessage> = _incomingMulticast
 
-    /** Stored on [start] so that [joinGroup] can launch beacon coroutines after startup. */
-    private lateinit var scope: CoroutineScope
+    private val _routes = MutableStateFlow<Map<NodeId, NeighborEntry>>(emptyMap())
+    /**
+     * Live view of the routing table. Emits a new snapshot whenever a route is added,
+     * updated, or evicted. [value] gives the current snapshot without subscribing.
+     *
+     * The flow is reset to an empty map on each [start] call so collectors see a clean
+     * slate after a restart without needing to resubscribe.
+     */
+    val routes: StateFlow<Map<NodeId, NeighborEntry>> = _routes.asStateFlow()
+
+    private var scope: CoroutineScope? = null
 
     @Volatile private var silent = false
 
@@ -142,18 +151,67 @@ class KiroRouter(
     // -------------------------------------------------------------------------
 
     /**
-     * Starts all per-link coroutines and the stale-entry eviction loop.
-     * Must be called exactly once before any other method.
+     * Configures and starts the router. Safe to call again after [stop] — all
+     * internal state is reset so the node starts fresh with no stale routes or groups.
+     *
+     * @param scope Parent scope whose cancellation also stops the router.
+     * @param selfId This node's unique identifier within the mesh.
+     * @param links All radio interfaces available to this node.
+     * @param txQueue Central transmit queue; injectable for testing.
+     * @param staleThreshold How long without a beacon refresh before a multicast tree
+     *   branch is considered dead and evicted. Should be at least 3× the beacon interval.
+     * @param neighborPurgeMultiplier How many missed OGM cycles before a neighbour table
+     *   entry is considered unreachable and removed.
      */
-    fun start(scope: CoroutineScope) {
-        this.scope = scope
+    fun start(
+        scope: CoroutineScope,
+        selfId: NodeId,
+        links: List<Link>,
+        txQueue: TxQueue = TxQueue(),
+        staleThreshold: Duration = 90.seconds,
+        neighborPurgeMultiplier: Int = 3
+    ) {
+        stop()  // cancel any previous run before reconfiguring
+
+        this.selfId               = selfId
+        this.links                = links
+        this.txQueue              = txQueue
+        this.staleThreshold       = staleThreshold
+        this.neighborPurgeMultiplier = neighborPurgeMultiplier
+        this.silent               = false
+
+        _routes.value   = emptyMap()
+        neighborTable   = ConcurrentHashMap()
+        seenOgms        = SeenWindowCache()
+        ogmSeq          = AtomicInteger(0)
+        pendingRelays   = ConcurrentHashMap()
+        multicastTree   = MulticastTree()
+        seenMulticasts  = SeenWindowCache()
+        multicastSeq    = AtomicInteger(0)
+        localGroups     = ConcurrentHashMap.newKeySet()
+        groupRoots      = ConcurrentHashMap()
+
+        val job = Job(scope.coroutineContext[Job])
+        val routerScope = CoroutineScope(scope.coroutineContext + job)
+        this.scope = routerScope
+
         links.forEach { link ->
-            scope.launch { receiveLoop(link) }   // inbound frame dispatch
-            scope.launch { ogmLoop(link) }        // periodic OGM heartbeat
-            scope.launch { txLoop(link) }         // pulls from TxQueue and calls link.broadcast
+            routerScope.launch { receiveLoop(link) }   // inbound frame dispatch
+            routerScope.launch { ogmLoop(link) }        // periodic OGM heartbeat
+            routerScope.launch { txLoop(link) }         // pulls from TxQueue and calls link.broadcast
         }
-        scope.launch { staleEvictionLoop() }      // prunes dead multicast tree branches
-        scope.launch { neighborPurgeLoop() }      // evicts unreachable neighbour table entries
+        routerScope.launch { staleEvictionLoop() }      // prunes dead multicast tree branches
+        routerScope.launch { neighborPurgeLoop() }      // evicts unreachable neighbour table entries
+    }
+
+    /**
+     * Cancels all protocol loops and resets the router to an idle state.
+     * The [incomingData] and [incomingMulticast] flows remain valid; collectors
+     * do not need to resubscribe before the next [start] call.
+     */
+    fun stop() {
+        scope?.coroutineContext?.get(Job)?.cancel()
+        scope = null
     }
 
     // -------------------------------------------------------------------------
@@ -203,7 +261,7 @@ class KiroRouter(
         localGroups.add(gid)
         if (roots.isNotEmpty()) groupRoots[gid] = roots
         if (roots.isNotEmpty() && selfId !in roots) {
-            scope.launch { beaconLoop(gid, beaconInterval) }
+            scope?.launch { beaconLoop(gid, beaconInterval) }
         }
     }
 
@@ -249,13 +307,6 @@ class KiroRouter(
             txQueue.enqueue(TxEntry(encode(frame), setOf(link), PacketFlavor.MULTICAST))
         }
     }
-
-    // -------------------------------------------------------------------------
-    // Public API — Diagnostics
-    // -------------------------------------------------------------------------
-
-    /** Returns a snapshot of the current routing table: destination → best route. */
-    fun routes(): Map<NodeId, NeighborEntry> = neighborTable.toMap()
 
     // -------------------------------------------------------------------------
     // Public API — Radio silence
@@ -380,10 +431,11 @@ class KiroRouter(
         while (true) {
             delay(checkInterval)
             val now = Instant.now()
-            neighborTable.entries.removeIf { (_, entry) ->
+            val removed = neighborTable.entries.removeIf { (_, entry) ->
                 val expiryMs = entry.link.ogmInterval.inWholeMilliseconds * neighborPurgeMultiplier
                 entry.lastSeen.plusMillis(expiryMs).isBefore(now)
             }
+            if (removed) _routes.value = neighborTable.toMap()
         }
     }
 
@@ -479,7 +531,7 @@ class KiroRouter(
         // the hearing count, but short relative to the OGM interval itself.
         val jitterMs = link.ogmInterval.inWholeMilliseconds / (8L + Random.nextLong(0L, 4L))
 
-        scope.launch {
+        scope?.launch {
             delay(jitterMs)
             // Read and remove the counter atomically; default to 1 if already removed.
             val finalCount = pendingRelays.remove(key)?.get() ?: 1
@@ -541,6 +593,7 @@ class KiroRouter(
                 else -> current
             }
         }
+        _routes.value = neighborTable.toMap()
     }
 
     /**
