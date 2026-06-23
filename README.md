@@ -157,13 +157,17 @@ When the primary root goes offline, members independently select the first alter
 ## Radio silence
 
 ```kotlin
-router.silence()    // halt all outgoing transmissions (OGMs, beacons, data, multicast)
+router.silence()    // shut the radio completely
 router.unsilence()  // resume
 ```
 
-While silent the internal protocol loops keep running and incoming frames are still processed, so the routing table stays current. The node can continue to forward other nodes' traffic — only its own transmissions are suppressed.
+While silent the node is completely dark on the wire:
 
-When `unsilence()` is called the OGM and beacon loops resume at their next scheduled interval; no burst of stale frames is sent.
+- No OGMs or beacons are emitted — the node disappears from neighbours' routing tables after their purge timeout.
+- No frames are relayed or forwarded, even for traffic not addressed to this node.
+- `send` and `sendMulticast` calls are dropped.
+
+Incoming frames are still decoded and the local routing table is still updated, so the node can resume routing immediately on `unsilence()`. The OGM and beacon loops keep running at their scheduled interval, so the node re-announces itself within one OGM cycle with no burst of stale frames.
 
 ---
 

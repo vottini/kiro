@@ -165,6 +165,7 @@ class KiroRouter(
      * Silently drops the frame if no route to [dstId] exists yet.
      */
     suspend fun send(dstId: NodeId, payload: ByteArray) {
+        if (silent) return
         val route = neighborTable[dstId] ?: return
         val frame = Frame.DataFrame(
             nextHop = route.nextHop,
@@ -240,6 +241,7 @@ class KiroRouter(
      * (i.e. no beacons have been received, so the tree is not yet built).
      */
     suspend fun sendMulticast(gid: GroupId, payload: ByteArray) {
+        if (silent) return
         val seq = multicastSeq.getAndIncrement().toUShort()
         seenMulticasts.markIfNew(selfId, seq)   // pre-mark to suppress our own echo
         val frame = Frame.MulticastFrame(selfId, gid, seq, MAX_TTL, payload)
@@ -260,20 +262,22 @@ class KiroRouter(
     // -------------------------------------------------------------------------
 
     /**
-     * Halts all outgoing transmissions on every link — OGMs, beacons, unicast and
-     * multicast data — without stopping the internal protocol loops. Received frames
-     * are still processed and the routing table is still maintained while silent, so
-     * the node can continue to act as a passive relay for other nodes' traffic.
+     * Completely shuts down the node's radio presence. While silent:
+     *  - No OGMs or beacons are emitted, so the node disappears from neighbours'
+     *    routing tables after their purge timeout.
+     *  - Received frames are still decoded and the local routing table is still
+     *    updated, but no frame is ever relayed or forwarded — the node does not
+     *    participate in the mesh as a transit hop.
+     *  - [send] and [sendMulticast] calls are silently dropped.
      *
-     * Call [unsilence] to resume transmitting.
+     * Call [unsilence] to resume. The node re-announces itself within one OGM cycle.
      */
     fun silence() { silent = true }
 
     /**
-     * Resumes outgoing transmissions after a call to [silence].
-     * OGM and beacon loops are already running and will enqueue their next frames
-     * at the next scheduled interval, so routing presence is re-established within
-     * one OGM cycle.
+     * Resumes full participation after [silence]. OGM and beacon loops are already
+     * running at their scheduled interval, so the node re-announces itself and
+     * resumes relaying within one OGM cycle.
      */
     fun unsilence() { silent = false }
 
@@ -289,8 +293,10 @@ class KiroRouter(
      */
     private suspend fun ogmLoop(link: Link) {
         while (true) {
-            val seq = ogmSeq.getAndIncrement().toUShort()
-            txQueue.enqueue(TxEntry(encode(Frame.OgmFrame(Ogm(selfId, selfId, seq, MAX_TTL))), setOf(link), PacketFlavor.OGM))
+            if (!silent) {
+                val seq = ogmSeq.getAndIncrement().toUShort()
+                txQueue.enqueue(TxEntry(encode(Frame.OgmFrame(Ogm(selfId, selfId, seq, MAX_TTL))), setOf(link), PacketFlavor.OGM))
+            }
             delay(link.ogmInterval)
         }
     }
@@ -304,7 +310,7 @@ class KiroRouter(
     private suspend fun txLoop(link: Link) {
         while (true) {
             val entry = txQueue.pollFor(link)
-            if (!silent) link.broadcast(entry.frame)
+            link.broadcast(entry.frame)
         }
     }
 
@@ -338,7 +344,7 @@ class KiroRouter(
             val activeRoot = resolveActiveRoot(gid) ?: run { delay(beaconInterval); return@run null } ?: continue
             val route = neighborTable[activeRoot]   ?: run { delay(beaconInterval); return@run null } ?: continue
             multicastTree.registerUpstream(gid, route.link)
-            txQueue.enqueue(TxEntry(
+            if (!silent) txQueue.enqueue(TxEntry(
                 frame         = encode(Frame.BeaconFrame(route.nextHop, selfId, gid, activeRoot)),
                 eligibleLinks = setOf(route.link),
                 flavor        = PacketFlavor.BEACON
@@ -477,7 +483,7 @@ class KiroRouter(
             delay(jitterMs)
             // Read and remove the counter atomically; default to 1 if already removed.
             val finalCount = pendingRelays.remove(key)?.get() ?: 1
-            if (shouldRelay(finalCount)) {
+            if (!silent && shouldRelay(finalCount)) {
                 // Relay on all links except the one the OGM arrived on.
                 // Skipping the incoming link avoids pointless retransmission back
                 // toward the sender and halves bandwidth use in sparse chains.
@@ -550,6 +556,7 @@ class KiroRouter(
             _incomingData.emit(frame.srcId to frame.payload)
             return
         }
+        if (silent) return
         if (frame.ttl == 0u.toUByte()) return
         val route = neighborTable[frame.dstId] ?: return
         txQueue.enqueue(TxEntry(
@@ -580,6 +587,7 @@ class KiroRouter(
         multicastTree.registerDownstream(frame.groupId, incomingLink)
 
         if (frame.activeRoot == selfId) return  // we are the current root; tree entry is enough
+        if (silent) return
 
         val route = neighborTable[frame.activeRoot] ?: return
         multicastTree.registerUpstream(frame.groupId, route.link)
@@ -605,6 +613,7 @@ class KiroRouter(
             _incomingMulticast.emit(MulticastMessage(frame.srcId, frame.groupId, frame.payload))
         }
 
+        if (silent) return
         if (frame.ttl == 0u.toUByte()) return
 
         val relayed = frame.copy(ttl = (frame.ttl - 1u).toUByte())
