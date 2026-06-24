@@ -657,4 +657,171 @@ class SimulationTest {
 
         coroutineContext.cancelChildren()
     }
+
+    // ─── Scenario 10: wide bottleneck beats fewer hops ───────────────────────
+    //
+    //   A(1) ──slow(100 bps)──────────────────────── B(3)   (1 hop, tier 6)
+    //   A(1) ──fast(100 Mbps)── C(2) ──fast(100 Mbps)── B(3)   (2 hops, tier 26)
+    //
+    //   The direct A→B link is the worst bottleneck (tier 6 ≈ 100 bps).
+    //   The 2-hop path via C has a much higher bottleneck (tier 26 ≈ 100 Mbps).
+    //   BATMAN must prefer the longer but wider path and route A→B via C.
+    //
+    //   Assertions
+    //   ─────────────────────────────────────────────────────────────────────
+    //   • After convergence A's route to B has nextHop = C (not B directly).
+    //   • minBandwidthTier in the route entry equals tier 26 (fast path).
+    //   • Unicast A→B is delivered (proves the route is actually used).
+
+    @Test
+    fun `scenario 10 — wide bottleneck 2-hop path beats narrow 1-hop path`() = runBlocking(Dispatchers.Default) {
+        val mSlow = SimMedium()   // A↔B slow direct link
+        val mAC   = SimMedium()   // A↔C fast link
+        val mCB   = SimMedium()   // C↔B fast link
+
+        val SLOW_BPS = 100L          // tier 6
+        val FAST_BPS = 100_000_000L  // tier 26
+
+        val a = node(1u,
+            simLink("A-slow", mSlow, bandwidthBps = SLOW_BPS),
+            simLink("A-C",    mAC,   bandwidthBps = FAST_BPS))
+        val c = node(2u,
+            simLink("C-A", mAC,   bandwidthBps = FAST_BPS),
+            simLink("C-B", mCB,   bandwidthBps = FAST_BPS))
+        val b = node(3u,
+            simLink("B-slow", mSlow, bandwidthBps = SLOW_BPS),
+            simLink("B-C",    mCB,   bandwidthBps = FAST_BPS))
+
+        listOf(a, c, b).forEach { it.startIn(this) }
+        delay(OGM_CONV + 100.milliseconds)   // extra cycle: 2-hop OGM from C needs to displace direct OGM
+
+        val routeToB = a.routes.value[3u.toUShort()]
+            ?: error("A has no route to B after convergence")
+
+        // Fast 2-hop path via C must win over slow 1-hop direct link.
+        assertEquals(c.selfId, routeToB.nextHop,
+            "A should route to B via C (wide bottleneck), not direct (narrow)")
+        assertEquals(bandwidthTier(FAST_BPS), routeToB.minBandwidthTier,
+            "Route minBandwidthTier should reflect the fast path (tier ${bandwidthTier(FAST_BPS)})")
+
+        // Prove the route is functional end-to-end.
+        val uAB = subscribeAndTrigger(b.incomingData) { a.send(3u, "wide wins".encodeToByteArray()) }
+        assertEquals("wide wins", uAB.awaitOrFail(message = "unicast A→B via wide path").second.decodeToString())
+
+        coroutineContext.cancelChildren()
+    }
+
+    // ─── Scenario 11: relay clamps minBandwidthTier on outgoing link ─────────
+    //
+    //   A(1) ──fast(100 Mbps)── B(2) ──slow(100 bps)── C(3)
+    //
+    //   A emits an OGM with minBandwidthTier = 26 (fast link).
+    //   B relays it onto the slow outgoing link and clamps:
+    //     minBandwidthTier = min(26, 6) = 6.
+    //   C must store tier 6 in its route entry for A, not tier 26.
+    //
+    //   Assertions
+    //   ─────────────────────────────────────────────────────────────────────
+    //   • C's route entry for A has minBandwidthTier = slow tier (6).
+    //   • B's route entry for A has minBandwidthTier = fast tier (26)
+    //     (B heard the OGM directly on the fast link; no clamping for B).
+
+    @Test
+    fun `scenario 11 — relay clamps minBandwidthTier to outgoing link tier`() = runBlocking(Dispatchers.Default) {
+        val mAB = SimMedium()   // fast A↔B
+        val mBC = SimMedium()   // slow B↔C
+
+        val SLOW_BPS = 100L
+        val FAST_BPS = 100_000_000L
+
+        val a = node(1u, simLink("A-B", mAB, bandwidthBps = FAST_BPS))
+        val b = node(2u,
+            simLink("B-A", mAB, bandwidthBps = FAST_BPS),
+            simLink("B-C", mBC, bandwidthBps = SLOW_BPS))
+        val c = node(3u, simLink("C-B", mBC, bandwidthBps = SLOW_BPS))
+
+        listOf(a, b, c).forEach { it.startIn(this) }
+        delay(OGM_CONV)
+
+        val bRouteToA = b.routes.value[1u.toUShort()]
+            ?: error("B has no route to A")
+        val cRouteToA = c.routes.value[1u.toUShort()]
+            ?: error("C has no route to A")
+
+        // B heard A's OGM directly on the fast link — no clamping.
+        assertEquals(bandwidthTier(FAST_BPS), bRouteToA.minBandwidthTier,
+            "B should see A's full fast-link tier (no clamping at B)")
+
+        // C received A's OGM relayed by B on the slow link — must be clamped.
+        assertEquals(bandwidthTier(SLOW_BPS), cRouteToA.minBandwidthTier,
+            "C should see the slow-link tier after B clamps on relay")
+
+        coroutineContext.cancelChildren()
+    }
+
+    // ─── Scenario 12: fallback to narrow path when wide path dies ────────────
+    //
+    //   A(1) ──fast── C(3) ──fast── B(2)   (wide 2-hop path, tier 26) ← preferred
+    //   A(1) ──slow─────────────── B(2)    (narrow 1-hop path, tier 6)  ← fallback
+    //
+    //   C is the relay on the fast path. When C is killed, A's fast-path entry
+    //   for B expires after the purge timeout, and the slow direct link becomes
+    //   the only surviving route.
+    //
+    //   Assertions
+    //   ─────────────────────────────────────────────────────────────────────
+    //   • Before: A routes to B via C (wide path wins).
+    //   • After C dies: A routes to B via slow direct link (narrow fallback).
+    //   • Unicast A→B is delivered after the switch, proving the route is live.
+
+    @Test
+    fun `scenario 12 — wide path dies, falls back to narrow direct link`() = runBlocking(Dispatchers.Default) {
+        val mSlow = SimMedium()   // A↔B slow direct link
+        val mAC   = SimMedium()   // A↔C fast link
+        val mCB   = SimMedium()   // C↔B fast link
+
+        val SLOW_BPS = 100L
+        val FAST_BPS = 100_000_000L
+
+        val a = node(1u,
+            simLink("A-slow", mSlow, bandwidthBps = SLOW_BPS),
+            simLink("A-C",    mAC,   bandwidthBps = FAST_BPS))
+        val b = node(2u,
+            simLink("B-slow", mSlow, bandwidthBps = SLOW_BPS),
+            simLink("B-C",    mCB,   bandwidthBps = FAST_BPS))
+        val c = node(3u,
+            simLink("C-A", mAC, bandwidthBps = FAST_BPS),
+            simLink("C-B", mCB, bandwidthBps = FAST_BPS))
+
+        val cJob = startKillable(c)
+        listOf(a, b).forEach { it.startIn(this) }
+        delay(OGM_CONV + 100.milliseconds)
+
+        // ── Before: A routes to B via C (wide path) ──
+        val routeBefore = a.routes.value[2u.toUShort()]
+            ?: error("A has no route to B before C dies")
+        assertEquals(c.selfId, routeBefore.nextHop,
+            "Before: A should prefer the wide 2-hop path via C")
+
+        // ── Kill C (wide path relay) ──
+        cJob.cancel()
+        // Wait for A's route via C to expire:
+        //   purge = neighborPurgeMultiplier(5) × ogmInterval(50 ms) = 250 ms,
+        //   plus one extra OGM cycle for the slow-path entry to establish itself.
+        delay(OGM_CONV)
+
+        // ── After: A must fall back to B via the slow direct link ──
+        val routeAfter = a.routes.value[2u.toUShort()]
+            ?: error("A lost all routes to B after C died — slow direct link should survive")
+        assertEquals(b.selfId, routeAfter.nextHop,
+            "After C dies: A should fall back to direct slow link (nextHop = B)")
+        assertEquals(bandwidthTier(SLOW_BPS), routeAfter.minBandwidthTier,
+            "Fallback route should reflect the slow-link tier")
+
+        // Prove the fallback route is functional.
+        val uAB = subscribeAndTrigger(b.incomingData) { a.send(2u, "fallback".encodeToByteArray()) }
+        assertEquals("fallback", uAB.awaitOrFail(message = "unicast A→B via slow fallback after C dies").second.decodeToString())
+
+        coroutineContext.cancelChildren()
+    }
 }

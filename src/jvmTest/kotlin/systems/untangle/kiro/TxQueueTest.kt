@@ -15,6 +15,7 @@ class TxQueueTest {
     private fun link(id: String): Link = object : Link {
         override val id = id
         override val ogmInterval: Duration = 1.seconds
+        override val bandwidthBps: Long = 100_000_000L
         override suspend fun broadcast(frame: ByteArray) = Unit
         override val frames: Flow<ByteArray> = emptyFlow()
     }
