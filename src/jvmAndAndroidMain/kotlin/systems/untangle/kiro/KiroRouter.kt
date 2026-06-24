@@ -343,10 +343,15 @@ class KiroRouter {
      * of which link the OGM went out on.
      */
     private suspend fun ogmLoop(link: Link) {
+        val tier = link.bandwidthTier
         while (true) {
             if (!silent) {
                 val seq = ogmSeq.getAndIncrement().toUShort()
-                txQueue.enqueue(TxEntry(encode(Frame.OgmFrame(Ogm(selfId, selfId, seq, MAX_TTL))), setOf(link), PacketFlavor.OGM))
+                txQueue.enqueue(TxEntry(
+                    frame         = encode(Frame.OgmFrame(Ogm(selfId, selfId, seq, MAX_TTL, tier))),
+                    eligibleLinks = setOf(link),
+                    flavor        = PacketFlavor.OGM
+                ))
             }
             delay(link.ogmInterval)
         }
@@ -523,7 +528,10 @@ class KiroRouter {
             return
         }
 
-        val relay = ogm.copy(senderId = selfId, ttl = (ogm.ttl - 1u).toUByte())
+        // Common relay fields: sender and TTL are the same for all outgoing links.
+        // minBandwidthTier varies per outgoing link — each link stamps its own tier
+        // as the new bottleneck minimum.
+        val relayBase = ogm.copy(senderId = selfId, ttl = (ogm.ttl - 1u).toUByte())
 
         // Jitter window: a random fraction of the link's OGM interval.
         // Dividing by a random value in [8, 11] gives roughly 9–12.5% of the interval,
@@ -540,6 +548,9 @@ class KiroRouter {
                 // Skipping the incoming link avoids pointless retransmission back
                 // toward the sender and halves bandwidth use in sparse chains.
                 links.filter { it.id != link.id }.forEach { outLink ->
+                    val relay = relayBase.copy(
+                        minBandwidthTier = minOf(ogm.minBandwidthTier, outLink.bandwidthTier)
+                    )
                     txQueue.enqueue(TxEntry(encode(Frame.OgmFrame(relay)), setOf(outLink), PacketFlavor.OGM))
                 }
             }
@@ -562,34 +573,37 @@ class KiroRouter {
      *
      * Three cases:
      *
-     *  1. **Better or equal path** (`ogm.ttl >= bestTtl`): replace the entry. Equal-TTL
-     *     OGMs keep re-electing the same or an equivalent sender each cycle, so
-     *     [lastSeen] is refreshed and the entry never goes stale under a stable topology.
+     *  1. **Better or equal path**: primary metric is [Ogm.minBandwidthTier] (wider
+     *     bottleneck wins); TTL is a tiebreaker when tiers are equal (fewer hops wins).
+     *     Replace the entry. Equal-quality OGMs keep re-electing the same next hop each
+     *     cycle, so [lastSeen] is refreshed and the entry never goes stale.
      *
-     *  2. **Worse path, same next hop and link** (`ogm.ttl < bestTtl`, same sender):
-     *     The originator is still reachable via the recorded next hop but at temporarily
-     *     degraded quality (e.g. an intermediate relay was suppressed). Refresh [lastSeen]
-     *     only — keep the better TTL, keep the next hop alive.
+     *  2. **Worse path, same next hop and link**: the originator is still reachable via
+     *     the recorded next hop at temporarily degraded quality. Refresh [lastSeen] only
+     *     to keep the entry alive; preserve the better recorded metric.
      *
-     *  3. **Worse path, different next hop or link**: A lower-quality alternative route
-     *     exists, but it gives no evidence that the current next hop is still forwarding.
-     *     Leave the entry unchanged. If the current next hop has gone silent, the entry
-     *     will expire naturally after [neighborPurgeMultiplier] × [Link.ogmInterval] and
-     *     the next OGM from the alternative path will install a fresh (lower-quality) entry.
+     *  3. **Worse path, different next hop or link**: a lower-quality alternative exists
+     *     but gives no evidence the current next hop is still forwarding. Leave unchanged.
+     *     After [neighborPurgeMultiplier] × [Link.ogmInterval] of silence the entry
+     *     expires and the alternative installs itself.
      */
     private fun updateNeighborTable(ogm: Ogm, link: Link) {
         neighborTable.compute(ogm.originatorId) { _, current ->
             val now = Instant.now()
             when {
-                current == null || ogm.ttl >= current.bestTtl -> NeighborEntry(
-                    nextHop  = ogm.senderId,
-                    link     = link,
-                    bestTtl  = ogm.ttl,
-                    lastSeq  = ogm.seqNum,
-                    lastSeen = now
-                )
+                current == null
+                || ogm.minBandwidthTier > current.minBandwidthTier
+                || (ogm.minBandwidthTier == current.minBandwidthTier && ogm.ttl >= current.bestTtl) ->
+                    NeighborEntry(
+                        nextHop          = ogm.senderId,
+                        link             = link,
+                        minBandwidthTier = ogm.minBandwidthTier,
+                        bestTtl          = ogm.ttl,
+                        lastSeq          = ogm.seqNum,
+                        lastSeen         = now
+                    )
                 ogm.senderId == current.nextHop && link.id == current.link.id ->
-                    current.copy(lastSeen = now)
+                    current.copy(lastSeq = ogm.seqNum, lastSeen = now)
                 else -> current
             }
         }

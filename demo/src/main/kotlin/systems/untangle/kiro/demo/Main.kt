@@ -122,8 +122,8 @@ private suspend fun handleCommand(
             else routes.entries
                 .sortedBy { it.key.toInt() }
                 .forEach { (dst, e) ->
-                    println("  dst=%-5s nextHop=%-5s medium=%-12s ttl=%d"
-                        .format(dst, e.nextHop, e.link.id, e.bestTtl.toInt()))
+                    println("  dst=%-5s nextHop=%-5s medium=%-12s tier=%d"
+                        .format(dst, e.nextHop, e.link.id, e.minBandwidthTier.toInt()))
                 }
         }
 

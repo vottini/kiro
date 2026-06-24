@@ -30,10 +30,23 @@ interface Link {
     /**
      * How often this node broadcasts its own OGM on this link.
      * Slower (band-limited) links use longer intervals to reduce medium utilisation.
-     * The interval also acts as an implicit routing metric: routes through faster
-     * links deliver OGMs more frequently and therefore win in the neighbour table.
      */
     val ogmInterval: Duration
+
+    /**
+     * Physical capacity of this link in bits per second.
+     *
+     * Used as the primary routing metric: each OGM carries the minimum bandwidth
+     * tier seen across all links it has traversed. The router prefers the path
+     * whose bottleneck link is widest — a 3-hop all-WiFi path beats a 2-hop
+     * WiFi+LoRa path when the LoRa link is the bottleneck.
+     *
+     * The value is converted to a 6-bit log₂ tier ([bandwidthTier]) before being
+     * placed on the wire, so only powers-of-two distinctions matter for routing.
+     * Representative values: LoRa 50 bps → tier 5; LoRa 50 kbps → tier 15;
+     * WiFi 100 Mbps → tier 26; Ethernet 1 Gbps → tier 29.
+     */
+    val bandwidthBps: Long
 
     /**
      * Broadcasts [frame] to all nodes reachable on this medium.
@@ -51,3 +64,17 @@ interface Link {
      */
     val frames: Flow<ByteArray>
 }
+
+/**
+ * Converts a raw bandwidth in bits-per-second to a 6-bit log₂ tier (0–63).
+ *
+ * `tier = floor(log₂(bps))`, so each tier represents a 2× bandwidth step.
+ * Two links in the same tier are treated as equivalent for routing purposes.
+ * The tier fits in 6 bits, covering 1 bps (tier 0) through ~9 Pbps (tier 63).
+ */
+fun bandwidthTier(bps: Long): UByte =
+    if (bps <= 1L) 0u
+    else kotlin.math.log2(bps.toDouble()).toInt().coerceIn(0, 63).toUByte()
+
+/** Pre-computed [bandwidthTier] for this link's [Link.bandwidthBps]. */
+val Link.bandwidthTier: UByte get() = bandwidthTier(bandwidthBps)

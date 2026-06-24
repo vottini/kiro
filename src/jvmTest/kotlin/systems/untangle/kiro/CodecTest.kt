@@ -17,8 +17,9 @@ class CodecTest {
         origId: UShort = 1u,
         sendId: UShort = 2u,
         seq: UShort = 100u,
-        ttl: UByte = 10u
-    ) = Frame.OgmFrame(Ogm(origId, sendId, seq, ttl))
+        ttl: UByte = 10u,
+        minBandwidthTier: UByte = 26u
+    ) = Frame.OgmFrame(Ogm(origId, sendId, seq, ttl, minBandwidthTier))
 
     private fun data(
         nextHop: UShort = 3u,

@@ -24,6 +24,7 @@ class PipeLink(
     private val mediumDir: Path,
     private val selfId: UShort,
     override val ogmInterval: Duration = 5.seconds,
+    override val bandwidthBps: Long = 100_000_000L,
 ) : Link {
 
     private val selfPipe = mediumDir.resolve("node_$selfId")

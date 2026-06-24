@@ -10,33 +10,33 @@ class RouterConfigTest {
 
     // ── ogmInterval formula ───────────────────────────────────────────────────
 
-    @Test fun `50 bps 40 nodes yields ~77 s interval and purge mult 3`() {
+    @Test fun `50 bps 40 nodes yields ~90 s interval and purge mult 3`() {
         val cfg = recommendedConfig(50L, expectedNodes = 40)
-        // N×48 / (0.5×50) = 40×48/25 = 76.8 s
-        assertTrue(cfg.ogmInterval in 76.seconds..78.seconds, "ogmInterval=${cfg.ogmInterval}")
+        // N×56 / (0.5×50) = 40×56/25 = 89.6 s
+        assertTrue(cfg.ogmInterval in 89.seconds..91.seconds, "ogmInterval=${cfg.ogmInterval}")
         assertEquals(3, cfg.neighborPurgeMultiplier)
     }
 
-    @Test fun `500 bps 40 nodes yields ~7·7 s interval and purge mult 5`() {
+    @Test fun `500 bps 40 nodes yields ~9 s interval and purge mult 5`() {
         val cfg = recommendedConfig(500L, expectedNodes = 40)
-        // 40×48 / (0.5×500) = 7.68 s → 60/7.68 ≈ 7.8 → rounds to 8 → clamped to 5
-        assertTrue(cfg.ogmInterval in 7.seconds..8.seconds, "ogmInterval=${cfg.ogmInterval}")
+        // 40×56 / (0.5×500) = 8.96 s → 60/8.96 ≈ 6.7 → rounds to 7 → clamped to 5
+        assertTrue(cfg.ogmInterval in 8.seconds..10.seconds, "ogmInterval=${cfg.ogmInterval}")
         assertEquals(5, cfg.neighborPurgeMultiplier)
     }
 
-    @Test fun `5 kbps 40 nodes yields ~770 ms interval and purge mult 5`() {
-        // Formula gives 0.768 s; pass explicit floor below that to observe the raw result.
+    @Test fun `5 kbps 40 nodes yields ~896 ms interval and purge mult 5`() {
+        // Formula gives 0.896 s; pass explicit floor below that to observe the raw result.
         val cfg = recommendedConfig(5_000L, expectedNodes = 40, minOgmInterval = 100.milliseconds)
-        // 40×48 / (0.5×5000) = 0.768 s
-        assertTrue(cfg.ogmInterval in 760.milliseconds..780.milliseconds, "ogmInterval=${cfg.ogmInterval}")
+        // 40×56 / (0.5×5000) = 0.896 s
+        assertTrue(cfg.ogmInterval in 890.milliseconds..910.milliseconds, "ogmInterval=${cfg.ogmInterval}")
         assertEquals(5, cfg.neighborPurgeMultiplier)
     }
 
-    @Test fun `50 kbps 40 nodes yields ~77 ms interval and purge mult 5`() {
-        // Formula gives 0.0768 s; pass explicit floor below that to observe the raw result.
+    @Test fun `50 kbps 40 nodes yields ~90 ms interval and purge mult 5`() {
+        // Formula gives 0.0896 s; pass explicit floor below that to observe the raw result.
         val cfg = recommendedConfig(50_000L, expectedNodes = 40, minOgmInterval = 10.milliseconds)
-        // 40×48 / (0.5×50000) = 0.0768 s
-        assertTrue(cfg.ogmInterval in 76.milliseconds..78.milliseconds, "ogmInterval=${cfg.ogmInterval}")
+        // 40×56 / (0.5×50000) = 0.0896 s
+        assertTrue(cfg.ogmInterval in 89.milliseconds..91.milliseconds, "ogmInterval=${cfg.ogmInterval}")
         assertEquals(5, cfg.neighborPurgeMultiplier)
     }
 
@@ -85,7 +85,7 @@ class RouterConfigTest {
     // ── purge mult transitions ────────────────────────────────────────────────
 
     @Test fun `slow link purge mult is 3`() {
-        // Any interval > 20 s rounds to purge ≤ 3
+        // 89.6 s interval → 60/89.6 ≈ 0.67 → rounds to 1 → clamped to 3
         val cfg = recommendedConfig(50L, expectedNodes = 40)
         assertEquals(3, cfg.neighborPurgeMultiplier)
     }

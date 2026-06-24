@@ -25,14 +25,14 @@ data class RouterConfig(
  *
  * ## How it works
  *
- * Each of the [expectedNodes] nodes broadcasts a 6-byte OGM on every link once per
+ * Each of the [expectedNodes] nodes broadcasts a 7-byte OGM on every link once per
  * [RouterConfig.ogmInterval]. A link therefore carries at most:
  *
- *   N × 6 bytes / ogmInterval  bytes/sec of OGM traffic
+ *   N × 7 bytes / ogmInterval  bytes/sec of OGM traffic
  *
  * Solving for the interval that keeps this within the protocol budget:
  *
- *   ogmInterval = N × 48 bits / ((1 − dataFraction) × linkBandwidthBps)
+ *   ogmInterval = N × 56 bits / ((1 − dataFraction) × linkBandwidthBps)
  *
  * [RouterConfig.neighborPurgeMultiplier] is chosen so that the resulting
  * [RouterConfig.purgeTimeout] stays close to 60 s (clamped between 3 and 5 cycles).
@@ -70,9 +70,9 @@ fun recommendedConfig(
     require(dataFraction in 0.0..1.0) { "dataFraction must be between 0 and 1" }
     require(minOgmInterval.isPositive()) { "minOgmInterval must be positive" }
 
-    // N × 48 bits per OGM cycle must fit in the protocol slice of the channel.
+    // N × 56 bits per OGM cycle must fit in the protocol slice of the channel.
     val protocolBudgetBps = linkBandwidthBps * (1.0 - dataFraction)
-    val intervalSeconds   = (expectedNodes * 48.0) / protocolBudgetBps
+    val intervalSeconds   = (expectedNodes * 56.0) / protocolBudgetBps
     val ogmInterval       = intervalSeconds.seconds.coerceAtLeast(minOgmInterval)
 
     // Target a purge window of ~60 s so that node failures are detected within

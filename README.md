@@ -12,7 +12,8 @@ The library runs entirely at the application layer — no kernel modules, no raw
 - **Jitter-based relay suppression** — in a dense subnet of N neighbours, expected relays ≈ ln(N) instead of N−1
 - **Beacon-driven multicast spanning trees** — members build the tree themselves; no network-wide flooding
 - **Pull-model transmit queue** with rule-based ordering and per-handle cancellation, replacement and reordering
-- **Compact wire format** — 6 bytes for an OGM, 8 bytes for a beacon, varint-encoded payload length (no upper limit at the codec layer)
+- **Widest-path bandwidth routing** — OGMs carry the minimum bandwidth tier of every link traversed; the router always prefers the path whose bottleneck link is widest
+- **Compact wire format** — 7 bytes for an OGM, 8 bytes for a beacon, varint-encoded payload length (no upper limit at the codec layer)
 - **Fully coroutine-native** — every loop suspends instead of polling; slow radios never block fast ones
 
 ---
@@ -40,10 +41,11 @@ Requirements:
 ```kotlin
 // 1. Implement the Link interface for your physical medium.
 val radio: Link = object : Link {
-    override val id = "lora0"
-    override val ogmInterval = 5.seconds   // drives routing metric and relay timing
+    override val id           = "lora0"
+    override val ogmInterval  = 5.seconds         // drives relay jitter timing and purge detection
+    override val bandwidthBps = 50_000L            // used as the routing metric (widest-path)
     override suspend fun broadcast(frame: ByteArray) = radio.send(frame)
-    override val frames: Flow<ByteArray> = radioReceiveFlow()
+    override val frames: Flow<ByteArray>           = radioReceiveFlow()
 }
 
 // 2. Create a router and start it inside a CoroutineScope.
@@ -75,12 +77,15 @@ The only interface the library requires you to implement. It abstracts a single 
 interface Link {
     val id: String               // unique name used as a map key
     val ogmInterval: Duration    // how often this node emits OGMs on this link
+    val bandwidthBps: Long       // physical capacity in bits per second; the routing metric
     suspend fun broadcast(frame: ByteArray)
     val frames: Flow<ByteArray>  // cold Flow of every received raw frame
 }
 ```
 
-`ogmInterval` doubles as a routing metric: a link with a longer interval accumulates more TTL decay over multiple hops, so the protocol naturally prefers faster links when an alternative exists.
+`bandwidthBps` is the primary routing metric. Each OGM carries a running minimum of `floor(log₂(bps))` across every link it has traversed. The router always prefers the path whose bottleneck link is widest — a 3-hop all-WiFi path beats a 2-hop WiFi+LoRa path when LoRa is the bottleneck. TTL (hop count) is used only as a tiebreaker when two paths have the same bottleneck tier.
+
+`ogmInterval` controls how often OGMs are emitted and sets the jitter window for relay suppression. It also determines how quickly a missing neighbour is detected: an entry is evicted after `neighborPurgeMultiplier × ogmInterval` without a refresh.
 
 ### KiroRouter
 
@@ -130,6 +135,27 @@ router.routes.collect { table -> println(table) }
 ```
 
 `routes` is a `StateFlow` so it always holds the latest snapshot; new collectors receive it immediately without waiting for the next change. The flow is reset to an empty map on each `start` call, so collectors do not need to resubscribe after a restart.
+
+For UI or monitoring use cases, `asRouteSummaryFlow()` gives a lower-frequency view that only emits when something routing-relevant changes:
+
+```kotlin
+router.routes
+    .asRouteSummaryFlow()
+    .collect { table ->
+        table.forEach { (dst, summary) ->
+            println("$dst via ${summary.nextHop} on ${summary.linkId} tier=${summary.minBandwidthTier} [${summary.status}]")
+        }
+    }
+```
+
+Each `RouteSummary` replaces the raw `lastSeen` timestamp with a coarse `LinkStatus`:
+
+| Status | Meaning |
+|---|---|
+| `GOOD` | An OGM arrived within the last `ogmInterval` — path is fresh |
+| `WARNING` | At least one OGM cycle was missed — path may be degrading |
+
+When the purge threshold is exceeded the entry disappears from the map entirely; there is no third "dead" state. The `lastSeq` field is dropped because it carries no routing-decision value for observers. `distinctUntilChanged` suppresses any emission where only `lastSeen` was refreshed within the same status bucket — the common case for a healthy, stable network.
 
 ---
 
@@ -241,17 +267,17 @@ val cfg = recommendedConfig(
     dataFraction = 0.5           // reserve at least 50 % for application data
 )
 
-// cfg.ogmInterval           ≈ 77 ms
+// cfg.ogmInterval           ≈ 90 ms
 // cfg.neighborPurgeMultiplier = 5
-// cfg.purgeTimeout          ≈ 385 ms (= interval × multiplier)
+// cfg.purgeTimeout          ≈ 450 ms (= interval × multiplier)
 ```
 
-The formula: `ogmInterval = N × 48 bits / ((1 − dataFraction) × linkBandwidthBps)`, floored at `minOgmInterval` (default 5 s). The purge multiplier is chosen so `purgeTimeout ≈ 60 s` across all link speeds, clamped to [3, 5].
+The formula: `ogmInterval = N × 56 bits / ((1 − dataFraction) × linkBandwidthBps)`, floored at `minOgmInterval` (default 5 s). The purge multiplier is chosen so `purgeTimeout ≈ 60 s` across all link speeds, clamped to [3, 5].
 
 | Link speed | Nodes | ogmInterval | purgeMultiplier |
 |---|---|---|---|
-| 50 bps | 40 | ~77 s | 3 |
-| 500 bps | 40 | ~7.7 s | 5 |
+| 50 bps | 40 | ~90 s | 3 |
+| 500 bps | 40 | ~9 s | 5 |
 | 5 kbps | 40 | ~5 s (floor) | 5 |
 | 50 kbps | 40 | ~5 s (floor) | 5 |
 | ≥ 1 Gbps | any | 5 s (floor) | 5 |
@@ -264,7 +290,7 @@ All frames are bit-packed big-endian. Byte 0 always carries the 4-bit type tag i
 
 | Frame | Size | Notes |
 |---|---|---|
-| `OgmFrame` | 6 bytes | originatorId(12b) + senderId(12b) + ttl(4b) + seqNum(16b) |
+| `OgmFrame` | 7 bytes | originatorId(12b) + senderId(12b) + ttl(4b) + seqNum(16b) + minBandwidthTier(8b) |
 | `DataFrame` | 7 + n bytes | nextHop(12b) + src(12b) + dst(12b) + ttl(4b) + varint(len) + payload |
 | `BeaconFrame` | 8 bytes | nextHop(12b) + src(12b) + groupId(20b) + activeRoot(12b) |
 | `MulticastFrame` | 8 + n bytes | src(12b) + groupId(20b) + ttl(4b) + seqNum(16b) + varint(len) + payload |
@@ -277,7 +303,7 @@ Payload lengths use a 7-bit continuation varint: lengths ≤127 cost 1 byte, ≤
 
 ## Design notes
 
-**Why OGM interval as a metric?** A slower link emits OGMs less frequently, so OGMs from distant nodes arrive with a lower TTL. The routing table stores the best (highest) TTL seen, which naturally reflects the fewest hops over the fastest links. No extra metric field is needed.
+**Why widest-path bandwidth as the routing metric?** A pure hop-count metric (TTL) would prefer a 2-hop LoRa path over a 3-hop WiFi path regardless of the capacity difference — which is the wrong trade-off for heterogeneous radio meshes. Instead, each OGM carries `minBandwidthTier = floor(log₂(bps))` for the narrowest link it has traversed. The router keeps whichever path has the highest bottleneck tier; TTL breaks ties. This means a short slow path never wins over a longer fast path, and the log₂ encoding keeps the field in one byte while covering 1 bps (tier 0) through ~9 Pbps (tier 63).
 
 **Why pull-model TxQueue?** Each link's TX coroutine suspends in `pollFor` until a frame is available. A slow LoRa radio never delays a fast Ethernet link. No thread sleeps, no polling timers.
 
@@ -299,6 +325,7 @@ val link = UdpMulticastLink(
     multicastGroup = "239.0.0.1",   // administratively scoped, stays on the LAN
     port           = 5001,
     ogmInterval    = 2.seconds,
+    bandwidthBps   = 100_000_000L,  // 100 Mbps — used as the routing metric
 )
 link.startReading(scope)
 

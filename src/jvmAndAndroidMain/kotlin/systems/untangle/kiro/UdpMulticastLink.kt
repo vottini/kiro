@@ -64,6 +64,7 @@ class UdpMulticastLink(
     val port: Int,
     val networkInterface: NetworkInterface? = null,
     override val ogmInterval: Duration = 5.seconds,
+    override val bandwidthBps: Long = 100_000_000L,
     private val outboundTransform: (suspend (ByteArray) -> ByteArray?)? = null,
     private val inboundTransform:  (suspend (ByteArray) -> ByteArray?)? = null,
 ) : Link {

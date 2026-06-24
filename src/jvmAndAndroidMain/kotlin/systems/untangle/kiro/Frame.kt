@@ -14,14 +14,20 @@ package systems.untangle.kiro
  *   Recipients use this together with [SeenWindowCache] to detect duplicates and
  *   discard stale relays. Wraps around at UShort.MAX_VALUE (65535).
  * @property ttl Time-to-live; decremented at each relay hop. Prevents OGMs from
- *   circulating indefinitely. Also used as a path-quality metric: higher remaining
- *   TTL on arrival means fewer hops were traversed.
+ *   circulating indefinitely. Used as a tiebreaker when two paths have equal
+ *   [minBandwidthTier]: fewer hops (higher TTL) is preferred.
+ * @property minBandwidthTier Running minimum of [bandwidthTier] values across every
+ *   link this OGM has traversed. Set to the outgoing link's tier by the originator;
+ *   each relay updates it to `min(current, outgoingLink.bandwidthTier)`. The router
+ *   stores the highest value seen for each originator, selecting the path whose
+ *   bottleneck link is widest.
  */
 data class Ogm(
     val originatorId: NodeId,
     val senderId: NodeId,
     val seqNum: UShort,
-    val ttl: UByte
+    val ttl: UByte,
+    val minBandwidthTier: UByte,
 )
 
 /**

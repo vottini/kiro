@@ -26,13 +26,18 @@ class SimMedium {
     suspend fun emit(frame: ByteArray) { _flow.emit(frame) }
 }
 
-fun simLink(id: String, medium: SimMedium, interval: Duration = 50.milliseconds): Link =
-    object : Link {
-        override val id          = id
-        override val ogmInterval = interval
-        override suspend fun broadcast(frame: ByteArray) = medium.emit(frame)
-        override val frames: Flow<ByteArray>             = medium.flow
-    }
+fun simLink(
+    id: String,
+    medium: SimMedium,
+    interval: Duration = 50.milliseconds,
+    bandwidthBps: Long = 100_000_000L,
+): Link = object : Link {
+    override val id             = id
+    override val ogmInterval    = interval
+    override val bandwidthBps   = bandwidthBps
+    override suspend fun broadcast(frame: ByteArray) = medium.emit(frame)
+    override val frames: Flow<ByteArray>             = medium.flow
+}
 
 // ─── Simulation test suite ────────────────────────────────────────────────────
 
