@@ -23,21 +23,21 @@
 <body>
 <script>mermaid.initialize({ startOnLoad: true, theme: 'neutral', fontFamily: 'Georgia, serif' });</script>
 
-<h1>BATMAN Mesh Router — Visão Geral da Arquitetura</h1>
+<h1>BATMAN Mesh Router &mdash; Vis&atilde;o Geral da Arquitetura</h1>
 <p>
-  Uma implementação em Kotlin/JVM do algoritmo de roteamento <strong>BATMAN</strong>
-  (Better Approach To Mobile Ad-hoc Networking) voltada a redes mesh de rádio heterogêneas e com
-  largura de banda limitada. Cada nó descobre rotas inundando OGMs leves pela rede; nenhum nó
-  computa caminhos completos — apenas a decisão do próximo salto (<em>next-hop</em>) é tomada localmente.
+  Uma implementa&ccedil;&atilde;o em Kotlin/JVM do algoritmo de roteamento <strong>BATMAN</strong>
+  (Better Approach To Mobile Ad-hoc Networking) voltada a redes mesh de r&aacute;dio heterog&ecirc;neas e com
+  largura de banda limitada. Cada n&oacute; descobre rotas inundando OGMs leves pela rede; nenhum n&oacute;
+  computa caminhos completos &mdash; apenas a decis&atilde;o do pr&oacute;ximo salto (<em>next-hop</em>) &eacute; tomada localmente.
 </p>
 
-<!-- ═══════════════════════════════════════════════════════════ -->
+<!-- ======================================================= -->
 <h2>1. Mapa de Componentes</h2>
-<p>Os principais componentes em tempo de execução e seus relacionamentos:</p>
+<p>Os principais componentes em tempo de execu&ccedil;&atilde;o e seus relacionamentos:</p>
 
 <div class="mermaid">
 graph TD
-    subgraph BatmanRouter["BatmanRouter (um por nó)"]
+    subgraph BatmanRouter["BatmanRouter (um por no)"]
         RX["receiveLoop\npor Link"]
         OGM["ogmLoop\npor Link"]
         TX["txLoop\npor Link"]
@@ -50,11 +50,11 @@ graph TD
         NT["neighborTable\nConcurrentHashMap&lt;NodeId, NeighborEntry&gt;"]
         MT["MulticastTree\nmapas upstream + downstream por GroupId"]
         SC["SeenWindowCache\nBitSet sliding window por originador"]
-        GRP["localGroups / ownedGroups / groupDeputies"]
+        GRP["localGroups / groupRoots"]
     end
 
     subgraph IO
-        LINK["interface Link\n(serial, UDP, …)"]
+        LINK["interface Link\n(serial, UDP, ...)"]
         TXQ["TxQueue\nTreeSet + CompletableDeferred waiters"]
         CODEC["Codec\nencode() / decode()"]
     end
@@ -81,168 +81,186 @@ graph TD
     EVICT -->|"evictStale()"| MT
 </div>
 
-<!-- ═══════════════════════════════════════════════════════════ -->
-<h2>2. Inundação de OGM e Descoberta de Rotas</h2>
+<!-- ======================================================= -->
+<h2>2. Inunda&ccedil;&atilde;o de OGM e Descoberta de Rotas</h2>
 <p>
-  Cada nó periodicamente transmite um <strong>Originator Message (OGM)</strong> em cada um de seus links.
-  Nós de retransmissão reenviam OGMs que ainda não viram, decrementando o TTL e atualizando
-  <code>senderId</code> para o seu próprio ID. A métrica de roteamento é implícita: a qualidade de uma
-  rota é o <em>maior TTL restante</em> quando o OGM chega, equivalente a <em>15 − número de saltos</em>.
+  Cada n&oacute; periodicamente transmite um <strong>Originator Message (OGM)</strong> em cada um de seus links.
+  N&oacute;s de retransmiss&atilde;o reenviam OGMs que ainda n&atilde;o viram, decrementando o TTL e atualizando
+  <code>senderId</code> para o seu pr&oacute;prio ID. A m&eacute;trica de roteamento &eacute; a
+  <strong>largura de banda do caminho mais largo</strong>: cada OGM carrega um campo
+  <code>minBandwidthTier: UByte</code> igual a <code>floor(log&#8322;(bps))</code> do link mais estreito
+  j&aacute; percorrido. O roteador seleciona o caminho com o maior tier de gargalo; o TTL &eacute; usado
+  apenas como desempate.
 </p>
 
 <div class="mermaid">
 sequenceDiagram
-    participant A as Nó A (originador)
-    participant B as Nó B (relay)
-    participant C as Nó C (relay)
-    participant D as Nó D
+    participant A as No A (originador)
+    participant B as No B (relay)
+    participant C as No C (relay)
+    participant D as No D
 
     Note over A: ogmLoop dispara a cada ogmInterval
-    A->>B: OGM {origId=A, senderId=A, seq=N, ttl=15}
-    A->>C: OGM {origId=A, senderId=A, seq=N, ttl=15}
+    A->>B: OGM {origId=A, senderId=A, seq=N, ttl=15, tier=26}
+    A->>C: OGM {origId=A, senderId=A, seq=N, ttl=15, tier=26}
 
-    Note over B: seenCache miss → retransmite com jitter
-    B->>C: OGM {origId=A, senderId=B, seq=N, ttl=14}
-    B->>D: OGM {origId=A, senderId=B, seq=N, ttl=14}
+    Note over B: seenCache miss, retransmite com jitter
+    B->>C: OGM {origId=A, senderId=B, seq=N, ttl=14, tier=26}
+    B->>D: OGM {origId=A, senderId=B, seq=N, ttl=14, tier=26}
 
-    Note over C: recebeu 2 cópias → P(relay)=1/2
-    C-->>D: OGM {origId=A, senderId=C, seq=N, ttl=13}
+    Note over C: recebeu 2 copias, P(relay)=1/2
+    C-->>D: OGM {origId=A, senderId=C, seq=N, ttl=13, tier=24}
 
-    Note over D: neighborTable[A] = {nextHop=B, ttl=14, link=…}
+    Note over D: neighborTable[A] = {nextHop=B, tier=26, ttl=14, link=...}
 </div>
 
-<h3>Supressão de retransmissão</h3>
+<h3>Supress&atilde;o de retransmiss&atilde;o</h3>
 <ul>
   <li><strong>Deduplicação:</strong> <code>SeenWindowCache</code> usa um <code>BitSet</code> deslizante de 64 bits
-    por originador, tratando o wraparound de UShort (0–65535) via diferença modular com sinal.</li>
-  <li><strong>Jitter:</strong> a retransmissão é atrasada por <code>ogmInterval / (8 + rand(0,3))</code> para que
-    cópias vindas de caminhos diferentes cheguem dentro da janela e sejam contabilizadas.</li>
-  <li><strong>Supressão probabilística:</strong> após a janela de jitter, se <em>N</em> cópias foram recebidas,
-    a probabilidade de retransmitir é <code>1/N</code> — suprime naturalmente retransmissões redundantes
+    por originador, tratando o wraparound de UShort (0&ndash;65535) via diferen&ccedil;a modular com sinal.</li>
+  <li><strong>Jitter:</strong> a retransmiss&atilde;o &eacute; atrasada por <code>ogmInterval / (8 + rand(0,3))</code> para que
+    c&oacute;pias vindas de caminhos diferentes cheguem dentro da janela e sejam contabilizadas.</li>
+  <li><strong>Supress&atilde;o probabil&iacute;stica:</strong> ap&oacute;s a janela de jitter, se <em>N</em> c&oacute;pias foram recebidas,
+    a probabilidade de retransmitir &eacute; <code>1/N</code> &mdash; suprime naturalmente retransmiss&otilde;es redundantes
     em redes densas.</li>
-  <li><strong>Sem relay de volta:</strong> OGMs nunca são reenviados pelo link pelo qual chegaram.</li>
+  <li><strong>Sem relay de volta:</strong> OGMs nunca s&atilde;o reenviados pelo link pelo qual chegaram.</li>
 </ul>
 
-<!-- ═══════════════════════════════════════════════════════════ -->
-<h2>3. Grupos Multicast e Árvore de Espalhamento</h2>
+<!-- ======================================================= -->
+<h2>3. Grupos Multicast e &Aacute;rvore de Espalhamento</h2>
 <p>
-  O multicast é roteado em árvore, não inundado. A árvore é construída implicitamente por beacons
-  dos membros viajando em direção à raiz do grupo — cada nó de retransmissão no caminho registra
-  os dois trechos do beacon na <code>MulticastTree</code>, costurando progressivamente a árvore.
+  O multicast &eacute; roteado em &aacute;rvore, n&atilde;o inundado. A &aacute;rvore &eacute; constru&iacute;da implicitamente por beacons
+  dos membros viajando em dire&ccedil;&atilde;o &agrave; raiz do grupo &mdash; cada n&oacute; de retransmiss&atilde;o no caminho registra
+  os dois trechos do beacon na <code>MulticastTree</code>, costurando progressivamente a &aacute;rvore.
 </p>
 
-<h3>Construção da árvore e rastreamento direcional de links</h3>
+<h3>Constru&ccedil;&atilde;o da &aacute;rvore e rastreamento direcional de links</h3>
 <p>
-  A <code>MulticastTree</code> mantém dois conjuntos independentes de links por grupo:
+  A <code>MulticastTree</code> mant&eacute;m dois conjuntos independentes de links por grupo:
 </p>
 <ul>
-  <li><strong>Downstream</strong> — links dos quais chegam beacons (em direção aos membros).
+  <li><strong>Downstream</strong> &mdash; links dos quais chegam beacons (em dire&ccedil;&atilde;o aos membros).
     Registrado por <code>registerDownstream</code> ao receber um beacon.</li>
-  <li><strong>Upstream</strong> — o único link pelo qual beacons são encaminhados em direção à raiz.
+  <li><strong>Upstream</strong> &mdash; o &uacute;nico link pelo qual beacons s&atilde;o encaminhados em dire&ccedil;&atilde;o &agrave; raiz.
     Registrado por <code>registerUpstream</code>, que <em>substitui</em> qualquer link upstream anterior
-    em vez de acumulá-lo. Isso garante que, após uma mudança de rota, apenas o caminho atual
-    seja usado — links antigos não persistem e causam transmissões multicast duplicadas.</li>
+    em vez de acumul&aacute;-lo. Isso garante que, ap&oacute;s uma mudan&ccedil;a de rota, apenas o caminho atual
+    seja usado &mdash; links antigos n&atilde;o persistem e causam transmiss&otilde;es multicast duplicadas.</li>
 </ul>
 <p>
   Ao receber um <code>MulticastFrame</code>, <code>linksFor(groupId, except = incomingLink)</code>
-  mescla ambos os conjuntos e exclui o link de entrada, propagando o frame em todas as direções
-  válidas sem eco:
+  mescla ambos os conjuntos e exclui o link de entrada, propagando o frame em todas as dire&ccedil;&otilde;es
+  v&aacute;lidas sem eco:
 </p>
 <ul>
-  <li>Chega <strong>de um membro abaixo</strong>: encaminhado upstream (para a raiz) e para os ramos downstream irmãos.</li>
+  <li>Chega <strong>de um membro abaixo</strong>: encaminhado upstream (para a raiz) e para os ramos downstream irm&atilde;os.</li>
   <li>Chega <strong>da raiz</strong>: encaminhado apenas para os ramos downstream.</li>
 </ul>
 
+<h3>Ingresso e sa&iacute;da de grupos</h3>
+<p>
+  Qualquer n&oacute; pode ingressar em um grupo multicast diretamente chamando
+  <code>joinGroup(gid: GroupId, roots: List&lt;NodeId&gt;, beaconInterval: Duration)</code>.
+  A lista <code>roots</code> &eacute; uma lista ordenada de n&oacute;s candidatos a raiz. Se <code>selfId</code>
+  estiver presente em <code>roots</code>, o n&oacute; atua como raiz e n&atilde;o inicia um beacon loop (ele pr&oacute;prio
+  j&aacute; &eacute; o ponto de converg&ecirc;ncia). Caso contr&aacute;rio, o n&oacute; inicia um beacon loop em dire&ccedil;&atilde;o &agrave;
+  primeira raiz acess&iacute;vel da lista. Para encerrar a participa&ccedil;&atilde;o, o n&oacute; chama
+  <code>leaveGroup(gid: GroupId)</code>, que remove sua associa&ccedil;&atilde;o e deixa o beacon loop terminar
+  naturalmente.
+</p>
+<p>
+  <code>GroupId</code> &eacute; uma <code>value class GroupId(val id: UInt)</code> &mdash; um valor opaco
+  de 20 bits atribu&iacute;do pela aplica&ccedil;&atilde;o e transmitido como 20 bits brutos no wire.
+</p>
+
 <div class="mermaid">
 sequenceDiagram
-    participant Owner as Owner (dono)
+    participant Root as Root (raiz)
     participant Relay as Relay (retransmissor)
     participant Member as Member (membro)
 
-    Note over Owner: createGroup() → GroupId(owner=Owner, seq=0)
-    Owner->>Relay: InviteFrame {dst=Member, deputies=[…]}
-    Relay->>Member: InviteFrame {dst=Member, deputies=[…]}
-    Member->>Member: joinGroup() → inicia beaconLoop
+    Note over Root: joinGroup(gid, roots=[Root, Root2], ...)
+    Note over Root: selfId in roots, atua como raiz, sem beacon loop
+    Note over Member: joinGroup(gid, roots=[Root, Root2], ...)
+    Note over Member: selfId nao esta em roots, inicia beaconLoop
 
     loop a cada beaconInterval (se folha ou sem downstream ativo)
-        Member->>Relay: BeaconFrame {groupId, activeRoot=Owner, nextHop=Relay}
+        Member->>Relay: BeaconFrame {groupId, activeRoot=Root, nextHop=Relay}
         Note over Relay: registerDownstream(groupId, incomingLink)
         Note over Relay: registerUpstream(groupId, outgoingLink)
-        Relay->>Owner: BeaconFrame {groupId, activeRoot=Owner, nextHop=Owner}
-        Note over Owner: registerDownstream(groupId, incomingLink)
+        Relay->>Root: BeaconFrame {groupId, activeRoot=Root, nextHop=Root}
+        Note over Root: registerDownstream(groupId, incomingLink)
     end
 
-    Note over Owner: MulticastTree construída ✓
+    Note over Root: MulticastTree construida
 
-    Owner->>Relay: MulticastFrame {groupId, payload}
+    Root->>Relay: MulticastFrame {groupId, payload}
     Note over Relay: linksFor(groupId, except=incomingLink)
     Relay->>Member: MulticastFrame {groupId, payload}
 </div>
 
-<h3>Supressão de beacon em nós folha</h3>
+<h3>Supress&atilde;o de beacon em n&oacute;s folha</h3>
 <p>
-  Apenas nós <em>folha</em> precisam originar beacons. Um nó relay cujos beacons de membros downstream
-  já fluem por ele não precisa enviar o seu próprio — os beacons retransmitidos já mantêm o caminho
-  upstream ativo e os links do relay registrados na árvore.
+  Apenas n&oacute;s <em>folha</em> precisam originar beacons. Um n&oacute; relay cujos beacons de membros downstream
+  j&aacute; fluem por ele n&atilde;o precisa enviar o seu pr&oacute;prio &mdash; os beacons retransmitidos j&aacute; mant&ecirc;m o caminho
+  upstream ativo e os links do relay registrados na &aacute;rvore.
 </p>
 <p>
-  A cada tick, o <code>beaconLoop</code> chama <code>MulticastTree.hasActiveDownstream(groupId, 2 × beaconInterval)</code>.
-  Se algum link downstream foi atualizado dentro dessa janela, o nó suprime seu próprio beacon naquele ciclo.
-  Quando todos os membros downstream ficam silenciosos e suas entradas são eviccionadas,
-  <code>hasActiveDownstream</code> retorna falso e o nó retoma o envio de beacons como folha,
-  restabelecendo seu próprio ramo.
+  A cada tick, o <code>beaconLoop</code> chama <code>MulticastTree.hasActiveDownstream(groupId, 2 x beaconInterval)</code>.
+  Se algum link downstream foi atualizado dentro dessa janela, o n&oacute; suprime seu pr&oacute;prio beacon naquele ciclo.
+  Quando todos os membros downstream ficam silenciosos e suas entradas s&atilde;o eviccionadas,
+  <code>hasActiveDownstream</code> retorna falso e o n&oacute; retoma o envio de beacons como folha,
+  restabelecendo seu pr&oacute;prio ramo.
 </p>
 
-<h3>Failover por deputies</h3>
+<h3>Failover de raiz</h3>
 <p>
-  Quando o dono do grupo está inacessível, a árvore de espalhamento não tem raiz para convergir.
-  Para sobreviver a isso, o dono embute uma <em>lista ordenada de deputies</em> no <code>InviteFrame</code>
-  enviado a cada membro. Cada <code>BeaconFrame</code> carrega o campo <code>activeRoot</code> —
-  o nó que atualmente atua como raiz da árvore.
+  Quando a raiz prim&aacute;ria est&aacute; inacess&iacute;vel, a &aacute;rvore de espalhamento n&atilde;o tem ponto de converg&ecirc;ncia.
+  A lista <code>roots: List&lt;NodeId&gt;</code> passada a <code>joinGroup</code> serve como lista
+  ordenada de candidatos para failover &mdash; nenhum mecanismo de convite ou lista de deputies &eacute; necess&aacute;rio.
 </p>
 <ul>
   <li><strong>Lado do membro:</strong> o <code>beaconLoop</code> chama <code>resolveActiveRoot</code>, que
-    tenta o dono do grupo primeiro, depois cada deputy em ordem, retornando o primeiro com rota
-    conhecida em <code>neighborTable</code>. O beacon é enviado em direção a esse candidato.</li>
-  <li><strong>Lado do relay:</strong> os nós relay leem <code>frame.activeRoot</code> para saber para onde
-    encaminhar o beacon. Eles não precisam de lista local de deputies — a raiz ativa está no próprio frame.
+    tenta cada entrada em <code>roots</code> em ordem, retornando a primeira com rota
+    conhecida em <code>neighborTable</code>. O beacon &eacute; enviado em dire&ccedil;&atilde;o a esse candidato.</li>
+  <li><strong>Lado do relay:</strong> os n&oacute;s relay leem <code>frame.activeRoot</code> para saber para onde
+    encaminhar o beacon. Eles n&atilde;o precisam de lista local de raiz &mdash; a raiz ativa est&aacute; no pr&oacute;prio frame.
     O encaminhamento para quando <code>frame.activeRoot == selfId</code>.</li>
-  <li><strong>Convergência:</strong> como todos os nós compartilham a mesma visão de acessibilidade via OGM,
-    eles concordam independentemente com o mesmo deputy, e a árvore reconverge sem coordenação.</li>
+  <li><strong>Converg&ecirc;ncia:</strong> como todos os n&oacute;s compartilham a mesma vis&atilde;o de acessibilidade via OGM,
+    eles concordam independentemente com o mesmo candidato, e a &aacute;rvore reconverge sem coordena&ccedil;&atilde;o.</li>
 </ul>
 
 <div class="mermaid">
 sequenceDiagram
-    participant Owner as Owner (offline)
-    participant Deputy as Deputy
+    participant Root as Root (offline)
+    participant Root2 as Root2
     participant Relay as Relay
     participant Member as Member
 
-    Note over Owner: dono fica inacessível
-    Note over Member: resolveActiveRoot() → dono inacessível → tenta Deputy
-    Member->>Relay: BeaconFrame {activeRoot=Deputy, nextHop=Relay}
-    Note over Relay: encaminha em direção ao Deputy (não ao Owner)
-    Relay->>Deputy: BeaconFrame {activeRoot=Deputy, nextHop=Deputy}
-    Note over Deputy: activeRoot==selfId → para; árvore agora enraizada aqui
+    Note over Root: Root fica inacessivel
+    Note over Member: resolveActiveRoot() tenta Root (inacessivel), depois Root2
+    Member->>Relay: BeaconFrame {activeRoot=Root2, nextHop=Relay}
+    Note over Relay: encaminha em direcao a Root2 (nao a Root)
+    Relay->>Root2: BeaconFrame {activeRoot=Root2, nextHop=Root2}
+    Note over Root2: activeRoot==selfId, para; arvore agora enraizada aqui
 
-    Deputy->>Relay: MulticastFrame {groupId, payload}
+    Root2->>Relay: MulticastFrame {groupId, payload}
     Relay->>Member: MulticastFrame {groupId, payload}
 </div>
 
-<h3>Remoção de ramos obsoletos</h3>
+<h3>Remo&ccedil;&atilde;o de ramos obsoletos</h3>
 <p>
   Cada <code>LinkEntry</code> na <code>MulticastTree</code> registra <code>lastSeen</code>.
   Um loop em segundo plano chama <code>evictStale(threshold)</code> a cada <code>threshold/3</code>;
-  ramos cujo membro parou de enviar beacons são podados após no máximo <code>threshold</code> de tempo.
-  As entradas upstream e downstream são eviccionadas independentemente.
+  ramos cujo membro parou de enviar beacons s&atilde;o podados ap&oacute;s no m&aacute;ximo <code>threshold</code> de tempo.
+  As entradas upstream e downstream s&atilde;o eviccionadas independentemente.
 </p>
 
-<!-- ═══════════════════════════════════════════════════════════ -->
-<h2>4. Fila de Transmissão</h2>
+<!-- ======================================================= -->
+<h2>4. Fila de Transmiss&atilde;o</h2>
 <p>
-  Uma fila central no modelo <strong>pull</strong> desacopla produtores (lógica de roteamento) de
-  consumidores (corrotinas TX por link). Cada link drena no seu próprio ritmo; um rádio lento
-  nunca bloqueia um rádio rápido.
+  Uma fila central no modelo <strong>pull</strong> desacopla produtores (l&oacute;gica de roteamento) de
+  consumidores (corrotinas TX por link). Cada link drena no seu pr&oacute;prio ritmo; um r&aacute;dio lento
+  nunca bloqueia um r&aacute;dio r&aacute;pido.
 </p>
 
 <div class="mermaid">
@@ -267,60 +285,60 @@ graph LR
     end
 
     P1 & P2 & P3 & P4 & P5 & P6 -->|"enqueue(TxEntry)"| TS
-    TS -->|"primeiro elegível"| T1
-    TS -->|"primeiro elegível"| T2
+    TS -->|"primeiro elegivel"| T1
+    TS -->|"primeiro elegivel"| T2
     WM -.->|"entrega direta\nse waiter aguardando"| T1
     WM -.->|"entrega direta\nse waiter aguardando"| T2
 </div>
 
-<h3>Ordenação por regras</h3>
+<h3>Ordena&ccedil;&atilde;o por regras</h3>
 <p>
   <code>TxQueue</code> recebe uma <code>List&lt;Rule&gt;</code> (cada uma um <code>Comparator&lt;TxEntry&gt;</code>)
-  composta em ordem. As regras padrão são:
+  composta em ordem. As regras padr&atilde;o s&atilde;o:
 </p>
 <ol>
-  <li><strong>controlFirst</strong> — OGM, BEACON, INVITE antes de MULTICAST, DATA</li>
-  <li><strong>olderFirst</strong> — FIFO dentro da mesma classe</li>
-  <li><strong>insertionOrderFirst</strong> — desempate de ordem total estrita para corretude do <code>TreeSet</code></li>
+  <li><strong>controlFirst</strong> &mdash; OGM, BEACON antes de MULTICAST, DATA</li>
+  <li><strong>olderFirst</strong> &mdash; FIFO dentro da mesma classe</li>
+  <li><strong>insertionOrderFirst</strong> &mdash; desempate de ordem total estrita para corretude do <code>TreeSet</code></li>
 </ol>
 
-<h3>Work stealing por links elegíveis</h3>
+<h3>Work stealing por links eleg&iacute;veis</h3>
 <p>
-  Cada <code>TxEntry</code> carrega um <code>Set&lt;Link&gt;</code> de rádios elegíveis em vez de um
-  único destino. A primeira corrotina TX a chamar <code>pollFor</code> para qualquer link elegível
+  Cada <code>TxEntry</code> carrega um <code>Set&lt;Link&gt;</code> de r&aacute;dios eleg&iacute;veis em vez de um
+  &uacute;nico destino. A primeira corrotina TX a chamar <code>pollFor</code> para qualquer link eleg&iacute;vel
   reivindica o frame exclusivamente. Isso viabiliza balanceamento de carga natural entre caminhos
   redundantes sem custo adicional.
 </p>
 
-<!-- ═══════════════════════════════════════════════════════════ -->
+<!-- ======================================================= -->
 <h2>5. Formato de Quadro (Wire Format)</h2>
 <p>
-  Todos os frames usam um layout compacto com empacotamento de bits. NodeIds têm 12 bits
-  (máximo de 4095 nós), TTL tem 4 bits (máximo de 15 saltos) e o tipo de frame ocupa o nibble
-  superior do byte 0. Autenticação versus criptografia é uma propriedade do link — nenhum flag
-  por frame é necessário.
+  Todos os frames usam um layout compacto com empacotamento de bits. NodeIds t&ecirc;m 12 bits
+  (m&aacute;ximo de 4095 n&oacute;s), TTL tem 4 bits (m&aacute;ximo de 15 saltos) e o tipo de frame ocupa o nibble
+  superior do byte 0. Autentica&ccedil;&atilde;o versus criptografia &eacute; uma propriedade do link &mdash; nenhum flag
+  por frame &eacute; necess&aacute;rio.
 </p>
 
 <table>
-  <tr><th>Frame</th><th>Tamanho</th><th>Economia vs. layout naïve de 16 bits</th><th>Nibble superior do byte 0 (tipo)</th></tr>
-  <tr><td>OGM</td><td>6 B</td><td>−2 B</td><td>0x0</td></tr>
-  <tr><td>DataFrame</td><td>7 + n B</td><td>−3 B</td><td>0x1</td></tr>
-  <tr><td>BeaconFrame</td><td>9 B</td><td>−2 B</td><td>0x2</td></tr>
-  <tr><td>MulticastFrame</td><td>9 + n B</td><td>−3 B</td><td>0x3</td></tr>
-  <tr><td>InviteFrame</td><td>9 + 2d B</td><td>−2 B base</td><td>0x4</td></tr>
+  <tr><th>Frame</th><th>Tamanho</th><th>Economia vs. layout na&iuml;ve de 16 bits</th><th>Nibble superior do byte 0 (tipo)</th></tr>
+  <tr><td>OGM</td><td>7 B</td><td>&minus;2 B</td><td>0x0</td></tr>
+  <tr><td>DataFrame</td><td>6 + varint + n B</td><td>&minus;1 B</td><td>0x1</td></tr>
+  <tr><td>BeaconFrame</td><td>8 B</td><td>&minus;2 B</td><td>0x2</td></tr>
+  <tr><td>MulticastFrame</td><td>7 + varint + n B</td><td>&minus;1 B</td><td>0x3</td></tr>
 </table>
 
 <p>
-  <em>n</em> = bytes de payload; <em>d</em> = número de deputies no convite (máximo 15, codificado em um nibble reservado).
+  <em>n</em> = bytes de payload; o comprimento do payload &eacute; codificado como prefixo varint.
+  Valores de tipo 0x4&ndash;0xF s&atilde;o reservados.
 </p>
 
 <p>Layout do byte 0, compartilhado por todos os tipos de frame:</p>
 <pre>
-  bits 7–4 : type (4 bits, valores 0–4 usados, 5–15 reservados)
-  bits 3–0 : firstId[11:8]  (nibble alto do identificador de 12 bits inicial)
+  bits 7-4 : type (4 bits, valores 0x0-0x3 usados, 0x4-0xF reservados)
+  bits 3-0 : firstId[11:8]  (nibble alto do identificador de 12 bits inicial)
 </pre>
 
-<p>Exemplo de layout do OGM (6 bytes):</p>
+<p>Layout do OGM (7 bytes):</p>
 <pre>
   B0: [type:4 | origId[11:8]:4]
   B1: origId[7:0]
@@ -328,95 +346,96 @@ graph LR
   B3: sendId[7:0]
   B4: seqNum[15:8]
   B5: seqNum[7:0]
+  B6: minBandwidthTier[7:0]
 </pre>
 
-<p>Layout do BeaconFrame (9 bytes), incluindo <code>activeRoot</code>:</p>
+<p>Layout do BeaconFrame (8 bytes), incluindo <code>activeRoot</code>:</p>
 <pre>
   B0: [type:4 | nextHop[11:8]:4]
   B1: nextHop[7:0]
-  B2: [srcId[11:8]:4  | owner[11:8]:4]
+  B2: [srcId[11:8]:4 | gid[19:16]:4]
   B3: srcId[7:0]
-  B4: owner[7:0]
-  B5: groupSeq[15:8]
-  B6: groupSeq[7:0]
-  B7: [activeRoot[11:8]:4 | 0000]
-  B8: activeRoot[7:0]
+  B4: gid[15:8]
+  B5: gid[7:0]
+  B6: [activeRoot[11:8]:4 | spare:4]
+  B7: activeRoot[7:0]
 </pre>
 
-<p>Layout do InviteFrame (9 + 2d bytes), com contagem de deputies em nibble reservado:</p>
+<p>Layout do MulticastFrame (8 + n bytes):</p>
 <pre>
-  B0: [type:4      | nextHop[11:8]:4]
-  B1: nextHop[7:0]
-  B2: [srcId[11:8]:4  | dstId[11:8]:4]
-  B3: srcId[7:0]
-  B4: dstId[7:0]
-  B5: [owner[11:8]:4  | deputyCount:4]   ← nibble reservado carrega a contagem (0–15)
-  B6: owner[7:0]
-  B7: groupSeq[15:8]
-  B8: groupSeq[7:0]
-  para cada deputy i (2 bytes cada):
-    B(9+2i):   [deputy[11:8]:4 | 0000]
-    B(9+2i+1): deputy[7:0]
+  B0: [type:4 | srcId[11:8]:4]
+  B1: srcId[7:0]
+  B2: [gid[19:16]:4 | ttl[3:0]:4]
+  B3: gid[15:8]
+  B4: gid[7:0]
+  B5: mcastSeq[15:8]
+  B6: mcastSeq[7:0]
+  B7...: varint(payloadLen) + payload
 </pre>
 
 <p>
-  O <code>GroupId</code> é transmitido como seus campos constituintes (owner de 12 bits + seq de 16 bits)
-  em vez de um <code>UInt</code> bruto de 32 bits, economizando 4 bits. Em memória ele é uma data class:
-  <code>data class GroupId(val owner: NodeId, val seq: UShort)</code>.
+  <code>GroupId</code> &eacute; uma <code>value class GroupId(val id: UInt)</code> &mdash; um valor opaco
+  de 20 bits atribu&iacute;do pela aplica&ccedil;&atilde;o. &Eacute; transmitido como 20 bits brutos distribu&iacute;dos pelos
+  campos dos frames de beacon e multicast mostrados acima (gid[19:16] em um nibble, gid[15:8] e gid[7:0]
+  nos dois bytes seguintes).
 </p>
 
-<!-- ═══════════════════════════════════════════════════════════ -->
-<h2>6. Principais Decisões de Projeto</h2>
+<!-- ======================================================= -->
+<h2>6. Principais Decis&otilde;es de Projeto</h2>
 
 <table>
-  <tr><th>Decisão</th><th>Justificativa</th></tr>
+  <tr><th>Decis&atilde;o</th><th>Justificativa</th></tr>
   <tr>
-    <td>Intervalo do OGM como métrica de roteamento</td>
-    <td>Links mais lentos emitem OGMs com menos frequência → acumulam TTL menor no destino → são preferidos apenas quando não existe caminho mais rápido. Sem overhead adicional.</td>
+    <td>Largura de banda do caminho mais largo como m&eacute;trica (<code>minBandwidthTier</code>)</td>
+    <td>Cada OGM carrega o tier de gargalo (<code>floor(log&#8322;(bps))</code>) do link mais estreito percorrido. Os roteadores preferem o caminho com o maior tier; o TTL &eacute; usado apenas como desempate. Isso favorece caminhos de alta vaz&atilde;o em vez de caminhos de baixa lat&ecirc;ncia mas lentos, o que &eacute; mais relevante para transfers de volume em r&aacute;dios com banda limitada.</td>
+  </tr>
+  <tr>
+    <td>Tier "melhor j&aacute; observado" por next-hop</td>
+    <td>Quando OGMs do mesmo originador chegam pelo mesmo next-hop com tiers variados (a supress&atilde;o de relay ocasionalmente escolhe um hop intermedi&aacute;rio mais lento), apenas <code>lastSeen</code> &eacute; atualizado; o tier armazenado nunca &eacute; reduzido. O tier de um dado next-hop s&oacute; pode aumentar at&eacute; a entrada expirar. Isso troca precis&atilde;o por resist&ecirc;ncia a ru&iacute;do: flutua&ccedil;&otilde;es transit&oacute;rias de relay n&atilde;o degradam a qualidade da rota armazenada, mas uma degrada&ccedil;&atilde;o permanente upstream n&atilde;o ser&aacute; refletida at&eacute; evic&ccedil;&atilde;o e reinstala&ccedil;&atilde;o.</td>
   </tr>
   <tr>
     <td>TxQueue no modelo pull</td>
-    <td>A corrotina TX de cada link suspende quando ociosa e acorda sob demanda via <code>CompletableDeferred</code>. Rádios lentos nunca bloqueiam rádios rápidos; sem polling ou busy-waiting.</td>
+    <td>A corrotina TX de cada link suspende quando ociosa e acorda sob demanda via <code>CompletableDeferred</code>. R&aacute;dios lentos nunca bloqueiam r&aacute;dios r&aacute;pidos; sem polling ou busy-waiting.</td>
   </tr>
   <tr>
     <td>Probabilidade de relay 1/N</td>
-    <td>Em sub-redes densas onde N nós ouvem o mesmo OGM, em média apenas 1/N retransmite — equivalente a um único relay em expectativa, reduzindo drasticamente tempestades de OGM.</td>
+    <td>Em sub-redes densas onde N n&oacute;s ouvem o mesmo OGM, em m&eacute;dia apenas 1/N retransmite &mdash; equivalente a um &uacute;nico relay em expectativa, reduzindo drasticamente tempestades de OGM.</td>
   </tr>
   <tr>
-    <td>Árvore multicast via beacon</td>
-    <td>Evita inundação no multicast fazendo com que os próprios membros construam a árvore com beacons periódicos. O dono só precisa encaminhar pelos ramos registrados.</td>
+    <td>&Aacute;rvore multicast via beacon</td>
+    <td>Evita inunda&ccedil;&atilde;o no multicast fazendo com que os pr&oacute;prios membros construam a &aacute;rvore com beacons peri&oacute;dicos. A raiz s&oacute; precisa encaminhar pelos ramos registrados.</td>
   </tr>
   <tr>
     <td>MulticastTree direcional (upstream / downstream)</td>
-    <td>Separar upstream (em direção à raiz) de downstream (em direção aos membros) viabiliza a supressão de folha e previne links upstream obsoletos — um nó relay pode suprimir seu próprio beacon enquanto ainda encaminha multicasts corretamente em ambas as direções.</td>
+    <td>Separar upstream (em dire&ccedil;&atilde;o &agrave; raiz) de downstream (em dire&ccedil;&atilde;o aos membros) viabiliza a supress&atilde;o de folha e previne links upstream obsoletos &mdash; um n&oacute; relay pode suprimir seu pr&oacute;prio beacon enquanto ainda encaminha multicasts corretamente em ambas as dire&ccedil;&otilde;es.</td>
   </tr>
   <tr>
-    <td>Link upstream único (substituição, não acumulação)</td>
-    <td><code>registerUpstream</code> substitui o link upstream atual de forma atômica. Quando a melhor rota para a raiz muda, o link antigo é descartado imediatamente em vez de persistir até a evicção — eliminando transmissões multicast duplicadas durante transições de rota.</td>
+    <td>Link upstream &uacute;nico (substitui&ccedil;&atilde;o, n&atilde;o acumula&ccedil;&atilde;o)</td>
+    <td><code>registerUpstream</code> substitui o link upstream atual de forma at&ocirc;mica. Quando a melhor rota para a raiz muda, o link antigo &eacute; descartado imediatamente em vez de persistir at&eacute; a evic&ccedil;&atilde;o &mdash; eliminando transmiss&otilde;es multicast duplicadas durante transi&ccedil;&otilde;es de rota.</td>
   </tr>
   <tr>
-    <td>Supressão de beacon em nós intermediários</td>
-    <td>Um nó relay cujos membros downstream estão ativamente enviando beacons por ele não precisa originar seu próprio beacon — os beacons retransmitidos já mantêm o caminho upstream ativo. Isso reduz pela metade o tráfego de beacon em cada salto intermediário de árvores profundas.</td>
+    <td>Supress&atilde;o de beacon em n&oacute;s intermedi&aacute;rios</td>
+    <td>Um n&oacute; relay cujos membros downstream est&atilde;o ativamente enviando beacons por ele n&atilde;o precisa originar seu pr&oacute;prio beacon &mdash; os beacons retransmitidos j&aacute; mant&ecirc;m o caminho upstream ativo. Isso reduz pela metade o tr&aacute;fego de beacon em cada salto intermedi&aacute;rio de &aacute;rvores profundas.</td>
   </tr>
   <tr>
-    <td>Failover por deputies via campo activeRoot</td>
-    <td>Os nós relay não precisam de lista local de deputies. A raiz atual é carregada no campo <code>activeRoot</code> de cada BeaconFrame. Os membros selecionam independentemente o primeiro candidato acessível (dono → deputies em ordem); como todos os nós compartilham a mesma visão de acessibilidade por OGM, convergem para a mesma escolha sem coordenação.</td>
+    <td>Failover de raiz via lista roots em joinGroup</td>
+    <td>Sem lista de deputies, sem frame de convite. A lista ordenada <code>roots</code> passada no ingresso serve tamb&eacute;m como lista de candidatos de failover. <code>resolveActiveRoot</code> escolhe a primeira entrada acess&iacute;vel; os n&oacute;s relay carregam a raiz ativa em cada BeaconFrame e n&atilde;o precisam de estado local. Como todos os n&oacute;s compartilham a mesma vis&atilde;o de acessibilidade via OGM, convergem para a mesma raiz independentemente.</td>
   </tr>
   <tr>
     <td>Janela deslizante com BitSet para deduplicação</td>
-    <td>O(1) por consulta, memória limitada (64 bits por originador), trata corretamente o wraparound de UShort via diferença modular com sinal.</td>
+    <td>O(1) por consulta, mem&oacute;ria limitada (64 bits por originador), trata corretamente o wraparound de UShort via diferen&ccedil;a modular com sinal.</td>
   </tr>
   <tr>
     <td>Limite de 12 bits para NodeId</td>
-    <td>Redes mesh com rádios de banda limitada raramente ultrapassam algumas centenas de nós. 12 bits (4095 nós) é suficiente e economiza 1 byte por campo NodeId no wire.</td>
+    <td>Redes mesh com r&aacute;dios de banda limitada raramente ultrapassam algumas centenas de n&oacute;s. 12 bits (4095 n&oacute;s) &eacute; suficiente e economiza 1 byte por campo NodeId no wire.</td>
   </tr>
 </table>
 
 <div class="note">
-  <strong>Expiração da tabela de vizinhos:</strong> cada entrada expira após
-  <code>ogmInterval × neighborPurgeMultiplier</code> (padrão 3×) sem um OGM de atualização.
+  <strong>Expira&ccedil;&atilde;o da tabela de vizinhos:</strong> cada entrada expira ap&oacute;s
+  <code>ogmInterval &times; neighborPurgeMultiplier</code> (padr&atilde;o 3&times;) sem um OGM de atualiza&ccedil;&atilde;o.
   Isso espelha o PURGE_TIMEOUT do batman-adv e garante que rotas obsoletas sejam removidas
-  automaticamente após um nó ficar silencioso.
+  automaticamente ap&oacute;s um n&oacute; ficar silencioso.
 </div>
 
 </body>

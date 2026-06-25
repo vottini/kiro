@@ -582,6 +582,15 @@ class KiroRouter {
      *     the recorded next hop at temporarily degraded quality. Refresh [lastSeen] only
      *     to keep the entry alive; preserve the better recorded metric.
      *
+     *     This applies when OGMs from the same next hop arrive with varying tiers across
+     *     OGM cycles (e.g. relay suppression happened to pick a slower intermediate hop
+     *     in this round). The stored tier can therefore only increase, never decrease,
+     *     for a given next-hop entry — it represents the best ever observed, not the
+     *     instantaneous value. If the upstream relay path permanently degrades without
+     *     the next hop disappearing, the stored tier will be stale-optimistic until the
+     *     entry is evicted and reinstalled. This mirrors BATMAN's "keep the best" design
+     *     and trades accuracy for noise resistance.
+     *
      *  3. **Worse path, different next hop or link**: a lower-quality alternative exists
      *     but gives no evidence the current next hop is still forwarding. Leave unchanged.
      *     After [neighborPurgeMultiplier] × [Link.ogmInterval] of silence the entry
