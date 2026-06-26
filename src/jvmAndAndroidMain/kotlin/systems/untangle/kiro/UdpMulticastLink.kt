@@ -47,8 +47,13 @@ import kotlin.time.Duration.Companion.seconds
  * @param multicastGroup IPv4 multicast address. Use an address in the
  *   administratively scoped 239.0.0.0/8 range for LAN-local deployments.
  * @param port UDP port. All nodes on the same medium must use the same port.
- * @param networkInterface Network interface to bind and join on, or `null` to
- *   use the JVM default (typically the first non-loopback interface).
+ * @param networkInterface Network interface to bind and join on. When non-null
+ *   the socket is bound to the interface's first IPv4 address, so datagrams
+ *   arriving on other interfaces — even for the same multicast group and port —
+ *   are not delivered to this socket. This allows two `UdpMulticastLink` instances
+ *   with the same group/port to coexist on different physical interfaces without
+ *   cross-contamination. When `null` the socket binds to the wildcard address
+ *   (default single-interface behaviour).
  * @param ogmInterval How often this node emits OGMs on this link. Longer
  *   intervals reduce bandwidth but slow route convergence.
  * @param outboundTransform Applied to every frame before it is transmitted.
@@ -75,9 +80,17 @@ class UdpMulticastLink(
     private val _frames = MutableSharedFlow<ByteArray>(extraBufferCapacity = 512)
     override val frames: Flow<ByteArray> = _frames
 
-    // MulticastSocket sets SO_REUSEADDR by default, allowing multiple processes
-    // on the same host to bind the same port for the same multicast group.
-    private val socket = MulticastSocket(port).also { s ->
+    // Bind to the specific local interface address so that datagrams arriving on
+    // other interfaces (even for the same multicast group and port) are not delivered
+    // to this socket. When networkInterface is null the socket binds to the wildcard
+    // address, preserving the default single-interface behaviour.
+    private val socket = MulticastSocket(null).also { s ->
+        s.reuseAddress = true
+        val bindAddr = networkInterface
+            ?.inetAddresses?.asSequence()
+            ?.filterIsInstance<java.net.Inet4Address>()
+            ?.firstOrNull()
+        s.bind(InetSocketAddress(bindAddr, port))
         s.joinGroup(groupSa, networkInterface)
     }
 

@@ -2,6 +2,7 @@ package systems.untangle.kiro
 
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableSharedFlow
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -72,14 +73,20 @@ class KiroRouter {
 
     var selfId: NodeId = 0u
         private set
-    var links: List<Link> = emptyList()
-        private set
     var txQueue: TxQueue = TxQueue()
         private set
     var staleThreshold: Duration = 90.seconds
         private set
     var neighborPurgeMultiplier: Int = 3
         private set
+
+    /** Live set of active links. Returns a snapshot; safe to call from any thread. */
+    val links: List<Link> get() = linksMap.values.toList()
+
+    private var linksMap = ConcurrentHashMap<String, Link>()
+
+    /** Per-link SupervisorJob: cancelling one stops only that link's three coroutines. */
+    private var linkJobs = ConcurrentHashMap<String, Job>()
     // --- Unicast routing state ---
 
     /** Next-hop routing table: originator NodeId → best known route entry. */
@@ -156,7 +163,8 @@ class KiroRouter {
      *
      * @param scope Parent scope whose cancellation also stops the router.
      * @param selfId This node's unique identifier within the mesh.
-     * @param links All radio interfaces available to this node.
+     * @param links Initial radio interfaces. More can be added later with [addLink];
+     *   individual links can be removed with [removeLink].
      * @param txQueue Central transmit queue; injectable for testing.
      * @param staleThreshold How long without a beacon refresh before a multicast tree
      *   branch is considered dead and evicted. Should be at least 3× the beacon interval.
@@ -173,12 +181,11 @@ class KiroRouter {
     ) {
         stop()  // cancel any previous run before reconfiguring
 
-        this.selfId               = selfId
-        this.links                = links
-        this.txQueue              = txQueue
-        this.staleThreshold       = staleThreshold
+        this.selfId                  = selfId
+        this.txQueue                 = txQueue
+        this.staleThreshold          = staleThreshold
         this.neighborPurgeMultiplier = neighborPurgeMultiplier
-        this.silent               = false
+        this.silent                  = false
 
         _routes.value   = emptyMap()
         neighborTable   = ConcurrentHashMap()
@@ -190,18 +197,59 @@ class KiroRouter {
         multicastSeq    = AtomicInteger(0)
         localGroups     = ConcurrentHashMap.newKeySet()
         groupRoots      = ConcurrentHashMap()
+        linksMap        = ConcurrentHashMap()
+        linkJobs        = ConcurrentHashMap()
 
         val job = Job(scope.coroutineContext[Job])
         val routerScope = CoroutineScope(scope.coroutineContext + job)
         this.scope = routerScope
 
-        links.forEach { link ->
-            routerScope.launch { receiveLoop(link) }   // inbound frame dispatch
-            routerScope.launch { ogmLoop(link) }        // periodic OGM heartbeat
-            routerScope.launch { txLoop(link) }         // pulls from TxQueue and calls link.broadcast
-        }
+        links.forEach { startLink(it) }
         routerScope.launch { staleEvictionLoop() }      // prunes dead multicast tree branches
         routerScope.launch { neighborPurgeLoop() }      // evicts unreachable neighbour table entries
+    }
+
+    /**
+     * Adds [link] to the running router and immediately starts its receive, OGM,
+     * and TX coroutines. Safe to call while the router is running. Has no effect
+     * if a link with the same [Link.id] is already registered (the existing link
+     * and its coroutines are left unchanged).
+     *
+     * Does nothing if the router has not been started.
+     */
+    fun addLink(link: Link) {
+        if (linksMap.putIfAbsent(link.id, link) == null) startLink(link)
+    }
+
+    /**
+     * Removes the link with [linkId] from the running router.
+     *
+     * The link's three coroutines (receive, OGM, TX) are cancelled immediately.
+     * Any routing table entries that were learned via this link are also evicted
+     * right away rather than waiting for the normal purge timeout, so the router
+     * does not keep forwarding traffic down a dead interface.
+     *
+     * Returns `true` if the link existed and was removed, `false` if not found.
+     * Does nothing if the router has not been started.
+     */
+    fun removeLink(linkId: String): Boolean {
+        linksMap.remove(linkId) ?: return false
+        linkJobs.remove(linkId)?.cancel()
+        val removed = neighborTable.entries.removeIf { (_, e) -> e.link.id == linkId }
+        if (removed) _routes.value = neighborTable.toMap()
+        return true
+    }
+
+    /** Launches the three per-link coroutines under their own [SupervisorJob]. */
+    private fun startLink(link: Link) {
+        val s = scope ?: return
+        linksMap[link.id] = link
+        val job = SupervisorJob(s.coroutineContext[Job])
+        linkJobs[link.id] = job
+        val linkScope = CoroutineScope(s.coroutineContext + job)
+        linkScope.launch { receiveLoop(link) }
+        linkScope.launch { ogmLoop(link) }
+        linkScope.launch { txLoop(link) }
     }
 
     /**
@@ -432,9 +480,8 @@ class KiroRouter {
      * is thread-safe and does not require external locking.
      */
     private suspend fun neighborPurgeLoop() {
-        val checkInterval = links.minOf { it.ogmInterval }
         while (true) {
-            delay(checkInterval)
+            delay(3.seconds)
             val now = Instant.now()
             val removed = neighborTable.entries.removeIf { (_, entry) ->
                 val expiryMs = entry.link.ogmInterval.inWholeMilliseconds * neighborPurgeMultiplier
@@ -547,7 +594,7 @@ class KiroRouter {
                 // Relay on all links except the one the OGM arrived on.
                 // Skipping the incoming link avoids pointless retransmission back
                 // toward the sender and halves bandwidth use in sparse chains.
-                links.filter { it.id != link.id }.forEach { outLink ->
+                linksMap.values.filter { it.id != link.id }.forEach { outLink ->
                     val relay = relayBase.copy(
                         minBandwidthTier = minOf(ogm.minBandwidthTier, outLink.bandwidthTier)
                     )

@@ -110,6 +110,24 @@ router.start(
 
 Call `router.start(scope, selfId, links)` before using any other method. All protocol loops run inside a child scope derived from `scope` — cancelling `scope` also stops the router, but `router.stop()` stops it independently without affecting `scope`. Calling `start` again after `stop` resets all internal state so the node restarts clean.
 
+### Dynamic link management
+
+Links can be added or removed while the router is running — no restart required.
+
+```kotlin
+// Add a new radio interface at runtime
+router.addLink(newLink)
+
+// Remove a radio interface (returns false if not found)
+router.removeLink(linkId = "lora1")
+```
+
+`addLink` immediately starts the receive, OGM, and TX coroutines for the new link. The link is eligible for OGM relay and unicast forwarding from the next OGM cycle onward.
+
+`removeLink` cancels those coroutines and **immediately evicts** any routing table entries that were learned via that link, rather than waiting for the normal purge timeout. This prevents the router from continuing to forward traffic down a dead interface.
+
+`router.links` always reflects the current live set.
+
 ---
 
 ## Unicast

@@ -806,9 +806,9 @@ class SimulationTest {
         // ── Kill C (wide path relay) ──
         cJob.cancel()
         // Wait for A's route via C to expire:
-        //   purge = neighborPurgeMultiplier(5) × ogmInterval(50 ms) = 250 ms,
-        //   plus one extra OGM cycle for the slow-path entry to establish itself.
-        delay(OGM_CONV)
+        //   purge timeout = neighborPurgeMultiplier(5) × ogmInterval(50 ms) = 250 ms,
+        //   but neighborPurgeLoop fires every 3 s, so we must wait at least that long.
+        delay(3.5.seconds)
 
         // ── After: A must fall back to B via the slow direct link ──
         val routeAfter = a.routes.value[2u.toUShort()]

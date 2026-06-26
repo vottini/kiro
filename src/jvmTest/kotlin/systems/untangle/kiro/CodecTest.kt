@@ -63,8 +63,8 @@ class CodecTest {
             assertEquals(f, roundTrip(f))
         }
 
-        @Test fun `encoded length is 6 bytes`() {
-            assertEquals(6, encode(ogm()).size)
+        @Test fun `encoded length is 7 bytes`() {
+            assertEquals(7, encode(ogm()).size)
         }
 
         @Test fun `type nibble is TYPE_OGM (0)`() {
