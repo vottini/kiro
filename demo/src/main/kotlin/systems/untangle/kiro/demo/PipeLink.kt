@@ -53,7 +53,7 @@ class PipeLink(
      * Reopens automatically after each EOF so the reader is always ready for
      * the next broadcaster's open-write-close cycle.
      */
-    fun startReading(scope: CoroutineScope) {
+    override fun start(scope: CoroutineScope) {
         scope.launch(Dispatchers.IO) {
             while (isActive) {
                 try {

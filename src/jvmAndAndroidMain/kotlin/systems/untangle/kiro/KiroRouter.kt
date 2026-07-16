@@ -233,33 +233,36 @@ class KiroRouter {
      * Does nothing if the router has not been started.
      */
     fun removeLink(linkId: String): Boolean {
-        linksMap.remove(linkId) ?: return false
+        val link = linksMap.remove(linkId) ?: return false
         linkJobs.remove(linkId)?.cancel()
+        link.stop()
         val removed = neighborTable.entries.removeIf { (_, e) -> e.link.id == linkId }
         if (removed) _routes.value = neighborTable.toMap()
         return true
     }
 
-    /** Launches the three per-link coroutines under their own [SupervisorJob]. */
+    /** Launches the three per-link coroutines under their own [SupervisorJob] and starts the link. */
     private fun startLink(link: Link) {
         val s = scope ?: return
         linksMap[link.id] = link
         val job = SupervisorJob(s.coroutineContext[Job])
         linkJobs[link.id] = job
         val linkScope = CoroutineScope(s.coroutineContext + job)
+        link.start(linkScope)
         linkScope.launch { receiveLoop(link) }
         linkScope.launch { ogmLoop(link) }
         linkScope.launch { txLoop(link) }
     }
 
     /**
-     * Cancels all protocol loops and resets the router to an idle state.
+     * Cancels all protocol loops, stops all links, and resets the router to an idle state.
      * The [incomingData] and [incomingMulticast] flows remain valid; collectors
      * do not need to resubscribe before the next [start] call.
      */
     fun stop() {
         scope?.coroutineContext?.get(Job)?.cancel()
         scope = null
+        linksMap.values.forEach { it.stop() }
     }
 
     // -------------------------------------------------------------------------

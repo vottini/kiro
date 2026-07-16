@@ -51,7 +51,6 @@ fun main(args: Array<String>) {
     println("type 'help' for commands\n")
 
     runBlocking {
-        links.forEach { it.startReading(this) }
         router.start(this, selfId = selfId, links = links)
 
         launch {

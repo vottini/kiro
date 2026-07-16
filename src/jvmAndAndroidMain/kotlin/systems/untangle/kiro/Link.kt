@@ -1,5 +1,6 @@
 package systems.untangle.kiro
 
+import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.flow.Flow
 import kotlin.time.Duration
 
@@ -63,6 +64,28 @@ interface Link {
      * the router inspects the nextHop field to decide whether to process or drop.
      */
     val frames: Flow<ByteArray>
+
+    /**
+     * Starts any background work needed to receive frames on this link (e.g. a UDP
+     * receive loop). Called by [KiroRouter] when the link is added to a running router.
+     *
+     * The default no-op implementation suits in-memory test doubles that push frames
+     * directly into their [frames] flow without a separate receive coroutine.
+     *
+     * @param scope Coroutine scope tied to this link's lifetime. The implementation
+     *   should launch all receive coroutines inside this scope so they are cancelled
+     *   automatically when [stop] is called.
+     */
+    fun start(scope: CoroutineScope): Unit = Unit
+
+    /**
+     * Tears down any background work started by [start] and releases transport
+     * resources (sockets, file handles, etc.).
+     *
+     * Called by [KiroRouter] when the link is removed or the router is stopped.
+     * The default no-op suits test doubles.
+     */
+    fun stop(): Unit = Unit
 }
 
 /**

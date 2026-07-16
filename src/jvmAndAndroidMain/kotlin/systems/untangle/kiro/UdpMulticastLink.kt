@@ -1,8 +1,13 @@
 package systems.untangle.kiro
 
-import kotlinx.coroutines.*
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.Flow
 import kotlinx.coroutines.flow.MutableSharedFlow
+import kotlinx.coroutines.isActive
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 import java.io.IOException
 import java.net.DatagramPacket
 import java.net.InetAddress
@@ -38,9 +43,8 @@ import kotlin.time.Duration.Companion.seconds
  *
  * ## Lifecycle
  *
- * Call [startReading] once inside the same [CoroutineScope] as [KiroRouter.start]
- * to begin receiving frames. Call [close] when tearing down to leave the
- * multicast group and unblock the receiver.
+ * Pass this link to [KiroRouter.start] or [KiroRouter.addLink]; the router calls
+ * [start] and [stop] automatically. No manual lifecycle management is required.
  *
  * @param id Human-readable medium name used as a routing table key
  *   (e.g. `"udp:239.0.0.1:5001"`). Must be unique among all links on a node.
@@ -98,10 +102,10 @@ class UdpMulticastLink(
      * Starts a background coroutine on [Dispatchers.IO] that receives UDP
      * datagrams from the multicast group and emits each frame to [frames].
      *
-     * The coroutine runs until the scope is cancelled. Call [close] after
-     * cancelling the scope to unblock the blocking [MulticastSocket.receive].
+     * The coroutine stops when [stop] is called or when [scope] is cancelled,
+     * whichever comes first.
      */
-    fun startReading(scope: CoroutineScope) {
+    override fun start(scope: CoroutineScope) {
         scope.launch(Dispatchers.IO) {
             val buffer = ByteArray(65536)
             while (isActive) {
@@ -127,8 +131,14 @@ class UdpMulticastLink(
         }
     }
 
-    /** Leaves the multicast group and closes the socket, unblocking [startReading]. */
-    fun close() {
+    /**
+     * Leaves the multicast group and closes the socket.
+     *
+     * The scope passed to [start] is cancelled by [KiroRouter] before calling this,
+     * which sets [isActive] to false in the receive loop. Closing the socket then
+     * unblocks any in-progress [MulticastSocket.receive] so the coroutine exits cleanly.
+     */
+    override fun stop() {
         runCatching { socket.leaveGroup(groupSa, networkInterface) }
         runCatching { socket.close() }
     }
