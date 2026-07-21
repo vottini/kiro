@@ -51,13 +51,12 @@ import kotlin.time.Duration.Companion.seconds
  * @param multicastGroup IPv4 multicast address. Use an address in the
  *   administratively scoped 239.0.0.0/8 range for LAN-local deployments.
  * @param port UDP port. All nodes on the same medium must use the same port.
- * @param networkInterface Network interface to bind and join on. When non-null
- *   the socket is bound to the interface's first IPv4 address, so datagrams
+ * @param networkInterface Network interface to join the multicast group on. When
+ *   non-null, the OS restricts group membership to that interface so datagrams
  *   arriving on other interfaces — even for the same multicast group and port —
  *   are not delivered to this socket. This allows two `UdpMulticastLink` instances
  *   with the same group/port to coexist on different physical interfaces without
- *   cross-contamination. When `null` the socket binds to the wildcard address
- *   (default single-interface behaviour).
+ *   cross-contamination. When `null`, the OS picks the default interface.
  * @param ogmInterval How often this node emits OGMs on this link. Longer
  *   intervals reduce bandwidth but slow route convergence.
  * @param outboundTransform Applied to every frame before it is transmitted.
@@ -84,17 +83,14 @@ class UdpMulticastLink(
     private val _frames = MutableSharedFlow<ByteArray>(extraBufferCapacity = 512)
     override val frames: Flow<ByteArray> = _frames
 
-    // Bind to the specific local interface address so that datagrams arriving on
-    // other interfaces (even for the same multicast group and port) are not delivered
-    // to this socket. When networkInterface is null the socket binds to the wildcard
-    // address, preserving the default single-interface behaviour.
+    // Always bind to the wildcard address so the kernel delivers multicast packets
+    // (whose destination is the group address, not any unicast address) to this socket.
+    // Interface isolation is provided entirely by joinGroup: joining on a specific
+    // networkInterface restricts membership to that interface, so packets received on
+    // other interfaces for the same group/port are not delivered here.
     private val socket = MulticastSocket(null).also { s ->
         s.reuseAddress = true
-        val bindAddr = networkInterface
-            ?.inetAddresses?.asSequence()
-            ?.filterIsInstance<java.net.Inet4Address>()
-            ?.firstOrNull()
-        s.bind(InetSocketAddress(bindAddr, port))
+        s.bind(InetSocketAddress(port))
         s.joinGroup(groupSa, networkInterface)
     }
 
