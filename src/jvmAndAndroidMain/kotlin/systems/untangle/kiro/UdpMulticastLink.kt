@@ -92,6 +92,9 @@ class UdpMulticastLink(
         s.reuseAddress = true
         s.bind(InetSocketAddress(port))
         s.joinGroup(groupSa, networkInterface)
+        // joinGroup only controls inbound delivery; setNetworkInterface controls
+        // which interface outbound multicast packets are sent from.
+        if (networkInterface != null) s.networkInterface = networkInterface
     }
 
     /**
