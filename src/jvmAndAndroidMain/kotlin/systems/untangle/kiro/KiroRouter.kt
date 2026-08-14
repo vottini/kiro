@@ -311,7 +311,11 @@ class KiroRouter {
     ) {
         localGroups.add(gid)
         if (roots.isNotEmpty()) groupRoots[gid] = roots
-        if (roots.isNotEmpty() && selfId !in roots) {
+        // Launch beaconLoop for any node that has roots defined. Nodes that are
+        // in the roots list themselves are handled naturally: resolveActiveRoot
+        // skips selfId (no neighborTable entry for self), so the loop will only
+        // beacon toward *other* reachable roots, not toward itself.
+        if (roots.isNotEmpty()) {
             scope?.launch { beaconLoop(gid, beaconInterval) }
         }
     }
