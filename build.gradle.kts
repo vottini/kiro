@@ -6,10 +6,10 @@ plugins {
 }
 
 group = "systems.untangle"
-version = "0.4.2"
+version = "0.4.3"
 
 kotlin {
-    jvmToolchain(17)
+    jvmToolchain(21)
     jvm()
     android {
         namespace = "systems.untangle.kiro"

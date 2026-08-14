@@ -131,11 +131,11 @@ class KiroRouter {
 
     // --- Public flows ---
 
-    private val _incomingData = MutableSharedFlow<Pair<NodeId, ByteArray>>()
+    private val _incomingData = MutableSharedFlow<Pair<NodeId, ByteArray>>(extraBufferCapacity = 64)
     /** Emits (srcId, payload) whenever a unicast [Frame.DataFrame] addressed to this node arrives. */
     val incomingData: SharedFlow<Pair<NodeId, ByteArray>> = _incomingData
 
-    private val _incomingMulticast = MutableSharedFlow<MulticastMessage>()
+    private val _incomingMulticast = MutableSharedFlow<MulticastMessage>(extraBufferCapacity = 64)
     /** Emits a [MulticastMessage] whenever a group multicast arrives and this node is a member. */
     val incomingMulticast: SharedFlow<MulticastMessage> = _incomingMulticast
 
@@ -352,9 +352,15 @@ class KiroRouter {
     suspend fun sendMulticast(gid: GroupId, payload: ByteArray) {
         if (silent) return
         val seq = multicastSeq.getAndIncrement().toUShort()
-        seenMulticasts.markIfNew(selfId, seq)   // pre-mark to suppress our own echo
+        seenMulticasts.markIfNew(selfId, seq)
         val frame = Frame.MulticastFrame(selfId, gid, seq, MAX_TTL, payload)
-        multicastTree.allLinksFor(gid).forEach { link ->
+        val links = multicastTree.allLinksFor(gid)
+        println("[SEND-MULTICAST $selfId] gid=$gid links=${links.map { it.id }}")
+        if (links.isEmpty()) {
+            println("[SEND-MULTICAST $selfId] tree is empty for gid=$gid — beacon not yet received by root or beaconLoop not running")
+        }
+        links.forEach { link ->
+            println("[SEND-MULTICAST $selfId] enqueuing on link=${link.id}")
             txQueue.enqueue(TxEntry(encode(frame), setOf(link), PacketFlavor.MULTICAST))
         }
     }
@@ -442,14 +448,22 @@ class KiroRouter {
      * becomes a leaf again and resumes beaconing on the next tick.
      */
     private suspend fun beaconLoop(gid: GroupId, beaconInterval: Duration) {
+        println("[BEACON-LOOP $selfId] started for gid=$gid interval=$beaconInterval")
         while (gid in localGroups) {
             if (multicastTree.hasActiveDownstream(gid, beaconInterval * 2)) {
-                // A downstream member is keeping the path alive — suppress our own beacon.
+                println("[BEACON-LOOP $selfId] suppressed — downstream active for gid=$gid")
                 delay(beaconInterval)
                 continue
             }
-            val activeRoot = resolveActiveRoot(gid) ?: run { delay(beaconInterval); return@run null } ?: continue
-            val route = neighborTable[activeRoot]   ?: run { delay(beaconInterval); return@run null } ?: continue
+            val activeRoot = resolveActiveRoot(gid) ?: run {
+                println("[BEACON-LOOP $selfId] no active root for gid=$gid (groupRoots=${groupRoots[gid]}), retrying in 1s")
+                delay(1.seconds); return@run null
+            } ?: continue
+            val route = neighborTable[activeRoot] ?: run {
+                println("[BEACON-LOOP $selfId] no route to root=$activeRoot for gid=$gid (neighborTable keys=${neighborTable.keys}), retrying in 1s")
+                delay(1.seconds); return@run null
+            } ?: continue
+            println("[BEACON-LOOP $selfId] sending beacon gid=$gid root=$activeRoot nextHop=${route.nextHop} link=${route.link.id}")
             multicastTree.registerUpstream(gid, route.link)
             if (!silent) txQueue.enqueue(TxEntry(
                 frame         = encode(Frame.BeaconFrame(route.nextHop, selfId, gid, activeRoot)),
@@ -679,7 +693,7 @@ class KiroRouter {
     private suspend fun handleData(frame: Frame.DataFrame) {
         if (frame.nextHop != selfId) return
         if (frame.dstId == selfId) {
-            _incomingData.emit(frame.srcId to frame.payload)
+            _incomingData.tryEmit(frame.srcId to frame.payload)
             return
         }
         if (silent) return
@@ -708,14 +722,26 @@ class KiroRouter {
      * needing to know about the group's root list.
      */
     private suspend fun handleBeacon(frame: Frame.BeaconFrame, incomingLink: Link) {
-        if (frame.nextHop != selfId) return
+        println("[HANDLE-BEACON $selfId] received beacon nextHop=${frame.nextHop} src=${frame.srcId} gid=${frame.groupId} root=${frame.activeRoot} link=${incomingLink.id}")
+        if (frame.nextHop != selfId) {
+            println("[HANDLE-BEACON $selfId] dropped — nextHop=${frame.nextHop} != selfId=$selfId")
+            return
+        }
 
+        println("[HANDLE-BEACON $selfId] registerDownstream gid=${frame.groupId} link=${incomingLink.id}")
         multicastTree.registerDownstream(frame.groupId, incomingLink)
 
-        if (frame.activeRoot == selfId) return  // we are the current root; tree entry is enough
+        if (frame.activeRoot == selfId) {
+            println("[HANDLE-BEACON $selfId] I am root, tree entry registered")
+            return
+        }
         if (silent) return
 
-        val route = neighborTable[frame.activeRoot] ?: return
+        val route = neighborTable[frame.activeRoot] ?: run {
+            println("[HANDLE-BEACON $selfId] no route to root=${frame.activeRoot}, cannot relay")
+            return
+        }
+        println("[HANDLE-BEACON $selfId] registerUpstream gid=${frame.groupId} link=${route.link.id} and relaying to nextHop=${route.nextHop}")
         multicastTree.registerUpstream(frame.groupId, route.link)
         txQueue.enqueue(TxEntry(
             frame         = encode(frame.copy(nextHop = route.nextHop)),
@@ -736,7 +762,7 @@ class KiroRouter {
         if (!seenMulticasts.markIfNew(frame.srcId, frame.seqNum)) return
 
         if (frame.groupId in localGroups) {
-            _incomingMulticast.emit(MulticastMessage(frame.srcId, frame.groupId, frame.payload))
+            _incomingMulticast.tryEmit(MulticastMessage(frame.srcId, frame.groupId, frame.payload))
         }
 
         if (silent) return

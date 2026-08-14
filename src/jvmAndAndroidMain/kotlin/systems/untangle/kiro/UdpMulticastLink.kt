@@ -123,10 +123,13 @@ class UdpMulticastLink(
 
     override suspend fun broadcast(frame: ByteArray) {
         val wire = if (outboundTransform != null) outboundTransform.invoke(frame) ?: return else frame
+        println("[UDP-BROADCAST $id] sending ${wire.size} bytes to $multicastGroup:$port")
         withContext(Dispatchers.IO) {
             try {
                 socket.send(DatagramPacket(wire, wire.size, group, port))
-            } catch (_: IOException) { }
+            } catch (e: IOException) {
+                println("[UDP-BROADCAST $id] IOException: $e")
+            }
         }
     }
 
