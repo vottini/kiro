@@ -43,7 +43,9 @@ kotlin {
 
 mavenPublishing {
     publishToMavenCentral()
-    signAllPublications()
+    if (!gradle.startParameter.taskNames.any { it.contains("MavenLocal", ignoreCase = true) }) {
+        signAllPublications()
+    }
 
     coordinates(
         group.toString(),
