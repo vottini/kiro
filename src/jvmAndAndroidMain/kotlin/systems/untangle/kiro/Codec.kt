@@ -16,6 +16,7 @@ private const val TYPE_OGM       = 0
 private const val TYPE_DATA      = 1
 private const val TYPE_BEACON    = 2
 private const val TYPE_MULTICAST = 3
+private const val TYPE_FLOOD     = 4
 
 /**
  * Serialises a [Frame] into the compact bit-packed wire format.
@@ -54,6 +55,10 @@ private const val TYPE_MULTICAST = 3
  *                B4=gid[7:0]                           B5=mcastSeq[15:8]
  *                B6=mcastSeq[7:0]                      B7…=varint(payloadLen)
  *                payload[0..n-1]
+ * FLOOD  6+n  B0=[type:4|srcId[11:8]:4]       B1=srcId[7:0]
+ *              B2=seqNum[15:8]                  B3=seqNum[7:0]
+ *              B4=[ttl[3:0]:4|spare:4]          B5…=varint(payloadLen)
+ *              payload[0..n-1]
  * ```
  *
  * Payload lengths are encoded as 7-bit continuation varints (little-endian groups of 7 bits,
@@ -67,6 +72,7 @@ fun encode(frame: Frame): ByteArray = when (frame) {
     is Frame.DataFrame      -> encodeData(frame)
     is Frame.BeaconFrame    -> encodeBeacon(frame)
     is Frame.MulticastFrame -> encodeMulticast(frame)
+    is Frame.FloodFrame     -> encodeFlood(frame)
 }
 
 /**
@@ -195,6 +201,48 @@ private fun encodeMulticast(frame: Frame.MulticastFrame): ByteArray {
     }
 }
 
+/**
+ * FLOOD: 6 + payload bytes.
+ *
+ * B0: [type:4|srcId[11:8]:4]
+ * B1: srcId[7:0]
+ * B2: seqNum[15:8]
+ * B3: seqNum[7:0]
+ * B4: [ttl:4|spare:4]
+ * B5…: varint(payloadLen) + payload
+ */
+private fun encodeFlood(frame: Frame.FloodFrame): ByteArray {
+    val srcId    = frame.srcId.toInt()   and 0xFFF
+    val seq      = frame.seqNum.toInt()  and 0xFFFF
+    val ttl      = frame.ttl.toInt()     and 0xF
+    val payload  = frame.payload
+    val lenBytes = encodeVarint(payload.size)
+    return ByteArray(5 + lenBytes.size + payload.size).also { b ->
+        b[0] = ((TYPE_FLOOD shl 4) or (srcId ushr 8)).toByte()
+        b[1] = (srcId and 0xFF).toByte()
+        b[2] = (seq ushr 8).toByte()
+        b[3] = (seq and 0xFF).toByte()
+        b[4] = (ttl shl 4).toByte()
+        lenBytes.copyInto(b, destinationOffset = 5)
+        payload.copyInto(b, destinationOffset = 5 + lenBytes.size)
+    }
+}
+
+private fun decodeFlood(raw: ByteArray, b0: Int): Frame? {
+    if (raw.size < 6) return null
+    val srcId  = ((b0 and 0xF) shl 8) or (raw[1].toInt() and 0xFF)
+    val seq    = (((raw[2].toInt() and 0xFF) shl 8) or (raw[3].toInt() and 0xFF)).toUShort()
+    val ttl    = ((raw[4].toInt() and 0xFF) ushr 4).toUByte()
+    val (payloadLen, varintSize) = decodeVarint(raw, 5)
+    if (varintSize < 0 || raw.size < 5 + varintSize + payloadLen) return null
+    return Frame.FloodFrame(
+        srcId   = srcId.toUShort(),
+        seqNum  = seq,
+        ttl     = ttl,
+        payload = raw.copyOfRange(5 + varintSize, 5 + varintSize + payloadLen)
+    )
+}
+
 // ── Varint helpers ────────────────────────────────────────────────────────────
 
 private fun encodeVarint(value: Int): ByteArray {
@@ -247,6 +295,7 @@ fun decode(raw: ByteArray): Frame? {
         TYPE_DATA      -> decodeData(raw, b0)
         TYPE_BEACON    -> decodeBeacon(raw, b0)
         TYPE_MULTICAST -> decodeMulticast(raw, b0)
+        TYPE_FLOOD     -> decodeFlood(raw, b0)
         else -> null
     }
 }

@@ -65,6 +65,12 @@ fun main(args: Array<String>) {
             }
         }
 
+        launch {
+            router.incomingFlood.collect { (srcId, payload) ->
+                println("[flood from $srcId] ${payload.decodeToString()}")
+            }
+        }
+
         val stdin = BufferedReader(InputStreamReader(System.`in`))
         while (isActive) {
             val line = withContext(Dispatchers.IO) { stdin.readLine() } ?: break
@@ -97,6 +103,11 @@ private suspend fun handleCommand(
         "mcast" -> {
             if (parts.size < 3) { println("usage: mcast <groupId> <message>"); return }
             router.sendMulticast(GroupId(parts[1].toUInt()), parts[2].encodeToByteArray())
+        }
+
+        "flood" -> {
+            if (parts.size < 2) { println("usage: flood <message>"); return }
+            router.flood(parts[1].encodeToByteArray())
         }
 
         "join" -> {
@@ -151,6 +162,7 @@ private val HELP = """
 commands:
   send  <dstId> <message>      unicast message to node
   mcast <groupId> <message>    multicast to group
+  flood <message>              flood message to all reachable nodes
   join  <groupId> [<rootId>]   join group (omit rootId to join as root)
   leave <groupId>              leave group
   routes                       show routing table

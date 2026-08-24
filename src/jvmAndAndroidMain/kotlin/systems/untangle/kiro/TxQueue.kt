@@ -21,7 +21,7 @@ import java.util.concurrent.atomic.AtomicLong
  * application-data flavors (DATA, MULTICAST) that can tolerate queueing.
  */
 enum class PacketFlavor {
-    OGM, BEACON, MULTICAST, DATA;
+    OGM, BEACON, MULTICAST, DATA, FLOOD;
 
     val isControl: Boolean get() = this == OGM || this == BEACON
 }
@@ -31,15 +31,21 @@ enum class PacketFlavor {
  * concern. Rules are composed in priority order by [TxQueue]: the first rule
  * that returns a non-zero comparison wins; later rules act as tiebreakers.
  *
- * Built-in rules: [controlFirst], [olderFirst], [insertionOrderFirst].
+ * Built-in rules: [controlFirst], [floodBeforeData], [olderFirst], [insertionOrderFirst].
  */
 typealias Rule = Comparator<TxEntry>
 
 /**
  * Control flavors (OGM, BEACON) are transmitted before data flavors
- * (DATA, MULTICAST) so that routing state stays fresh under congestion.
+ * (DATA, MULTICAST, FLOOD) so that routing state stays fresh under congestion.
  */
 val controlFirst: Rule = compareBy { if (it.flavor.isControl) 0 else 1 }
+
+/**
+ * Among non-control flavors, FLOOD is transmitted before DATA and MULTICAST
+ * so that distress signals are not queued behind application data.
+ */
+val floodBeforeData: Rule = compareBy { if (it.flavor == PacketFlavor.FLOOD) 0 else 1 }
 
 /**
  * Among entries with the same effective priority, older frames are sent first,
@@ -56,9 +62,9 @@ val insertionOrderFirst: Rule = compareBy { it.insertionOrder }
 
 /**
  * The default rule list applied when no custom rules are supplied to [TxQueue].
- * Applies: control before data → older before newer → insertion order.
+ * Applies: control before data → flood before data/multicast → older before newer → insertion order.
  */
-fun defaultRules(): List<Rule> = listOf(controlFirst, olderFirst, insertionOrderFirst)
+fun defaultRules(): List<Rule> = listOf(controlFirst, floodBeforeData, olderFirst, insertionOrderFirst)
 
 /**
  * Global monotonically increasing counter that assigns a unique insertion order

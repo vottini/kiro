@@ -46,6 +46,38 @@ sealed class Frame {
     data class OgmFrame(val ogm: Ogm) : Frame()
 
     /**
+     * A best-effort flood frame that propagates to every reachable node without
+     * requiring group membership or a spanning tree. Relayed on all links except
+     * the one it arrived on, with jitter-based suppression identical to OGM relay
+     * so that dense networks don't amplify transmissions.
+     *
+     * @property srcId Node that originated this flood (stays constant across hops).
+     * @property seqNum Per-originator sequence number for deduplication.
+     * @property ttl Decremented at each relay hop; prevents infinite propagation.
+     * @property payload Application-level data.
+     */
+    data class FloodFrame(
+        val srcId: NodeId,
+        val seqNum: UShort,
+        val ttl: UByte,
+        val payload: ByteArray
+    ) : Frame() {
+        override fun equals(other: Any?): Boolean {
+            if (this === other) return true
+            if (other !is FloodFrame) return false
+            return srcId == other.srcId && seqNum == other.seqNum &&
+                ttl == other.ttl && payload.contentEquals(other.payload)
+        }
+        override fun hashCode(): Int {
+            var result = srcId.hashCode()
+            result = 31 * result + seqNum.hashCode()
+            result = 31 * result + ttl.hashCode()
+            result = 31 * result + payload.contentHashCode()
+            return result
+        }
+    }
+
+    /**
      * Sent periodically by each group member toward the current tree root via unicast
      * routing. As the beacon travels hop-by-hop, every relay node records both the
      * incoming and outgoing links in the [MulticastTree], progressively building a

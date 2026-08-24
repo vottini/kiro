@@ -824,4 +824,131 @@ class SimulationTest {
 
         coroutineContext.cancelChildren()
     }
+
+    // ─── Scenario 13: flood reaches all nodes on a shared medium ─────────────
+    //
+    //   A(1) ──m1── B(2)
+    //   A(1) ──m1── C(3)
+    //
+    //   All three nodes share one medium. A floods — B and C both receive it.
+    //   A does NOT receive its own flood (pre-marked in seenFloods).
+    //
+    //   Assertions
+    //   ─────────────────────────────────────────────────────────────────────
+    //   • B and C both receive the flood from A with correct srcId and payload.
+    //   • A does not receive its own flood.
+
+    @Test
+    fun `scenario 13 — flood reaches all nodes on a shared medium`() = runBlocking(Dispatchers.Default) {
+        val m1 = SimMedium()
+        val a  = node(1u, simLink("A-1", m1))
+        val b  = node(2u, simLink("B-1", m1))
+        val c  = node(3u, simLink("C-1", m1))
+
+        a.startIn(this); b.startIn(this); c.startIn(this)
+        delay(OGM_CONV)
+
+        val gotB = CompletableDeferred<Pair<NodeId, ByteArray>>()
+        val gotC = CompletableDeferred<Pair<NodeId, ByteArray>>()
+        launch { b.incomingFlood.first().let { gotB.complete(it) } }
+        launch { c.incomingFlood.first().let { gotC.complete(it) } }
+        delay(SUB_DELAY)
+        a.flood("sos".encodeToByteArray())
+
+        val (srcB, payB) = gotB.awaitOrFail(message = "B should receive flood from A")
+        assertEquals(1u.toUShort(), srcB)
+        assertEquals("sos", payB.decodeToString())
+
+        val (srcC, payC) = gotC.awaitOrFail(message = "C should receive flood from A")
+        assertEquals(1u.toUShort(), srcC)
+        assertEquals("sos", payC.decodeToString())
+
+        // A must not receive its own flood.
+        val selfReceived = withTimeoutOrNull(500.milliseconds) { a.incomingFlood.first() }
+        assertNull(selfReceived, "A must not receive its own flood")
+
+        coroutineContext.cancelChildren()
+    }
+
+    // ─── Scenario 14: flood propagates across hops ───────────────────────────
+    //
+    //   A(1) ──m1── B(2) ──m2── C(3)
+    //
+    //   A and C cannot hear each other directly. A floods — B relays it to C.
+    //
+    //   Assertions
+    //   ─────────────────────────────────────────────────────────────────────
+    //   • C receives the flood originated by A (relayed through B).
+    //   • B also receives the flood directly from A.
+
+    @Test
+    fun `scenario 14 — flood propagates across hops`() = runBlocking(Dispatchers.Default) {
+        val m1 = SimMedium(); val m2 = SimMedium()
+        val a  = node(1u, simLink("A-1", m1))
+        val b  = node(2u, simLink("B-1", m1), simLink("B-2", m2))
+        val c  = node(3u, simLink("C-2", m2))
+
+        a.startIn(this); b.startIn(this); c.startIn(this)
+        delay(OGM_CONV)
+
+        val gotB = CompletableDeferred<Pair<NodeId, ByteArray>>()
+        val gotC = CompletableDeferred<Pair<NodeId, ByteArray>>()
+        launch { b.incomingFlood.first().let { gotB.complete(it) } }
+        launch { c.incomingFlood.first().let { gotC.complete(it) } }
+        delay(SUB_DELAY)
+        a.flood("help".encodeToByteArray())
+
+        val (srcB, payB) = gotB.awaitOrFail(message = "B should receive flood from A")
+        assertEquals(1u.toUShort(), srcB)
+        assertEquals("help", payB.decodeToString())
+
+        val (srcC, payC) = gotC.awaitOrFail(message = "C should receive flood relayed via B")
+        assertEquals(1u.toUShort(), srcC)
+        assertEquals("help", payC.decodeToString())
+
+        coroutineContext.cancelChildren()
+    }
+
+    // ─── Scenario 15: silent node still floods by default ────────────────────
+    //
+    //   A(1) ──m1── B(2)
+    //
+    //   A goes silent (suppresses OGMs and unicast), then floods.
+    //   B must still receive the flood because flood() ignores silent mode
+    //   by default (respectSilent = false).
+    //
+    //   Assertions
+    //   ─────────────────────────────────────────────────────────────────────
+    //   • B receives the flood even though A is silent.
+    //   • When flood(respectSilent = true) is used, B does NOT receive it.
+
+    @Test
+    fun `scenario 15 — silent node still floods by default`() = runBlocking(Dispatchers.Default) {
+        val m1 = SimMedium()
+        val a  = node(1u, simLink("A-1", m1))
+        val b  = node(2u, simLink("B-1", m1))
+
+        a.startIn(this); b.startIn(this)
+        delay(OGM_CONV)
+
+        a.silence()
+
+        // Default flood() ignores silent mode — B must receive it.
+        val gotB = subscribeAndTrigger(b.incomingFlood) {
+            a.flood("mayday".encodeToByteArray())
+        }
+        val (srcB, payB) = gotB.awaitOrFail(message = "B should receive flood from silent A")
+        assertEquals(1u.toUShort(), srcB)
+        assertEquals("mayday", payB.decodeToString())
+
+        // flood(respectSilent = true) honours silent mode — B must NOT receive it.
+        val suppressed = withTimeoutOrNull(500.milliseconds) {
+            subscribeAndTrigger(b.incomingFlood) {
+                a.flood("suppressed".encodeToByteArray(), respectSilent = true)
+            }.await()
+        }
+        assertNull(suppressed, "B must not receive flood when respectSilent = true and A is silent")
+
+        coroutineContext.cancelChildren()
+    }
 }

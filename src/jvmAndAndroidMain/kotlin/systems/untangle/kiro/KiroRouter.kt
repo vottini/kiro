@@ -117,6 +117,14 @@ class KiroRouter {
     /** Per-node multicast sequence counter for frames originated by this node. */
     private var multicastSeq = AtomicInteger(0)
 
+    // --- Flood state ---
+
+    /** Deduplicates flood frames so each (srcId, seqNum) is delivered/relayed once. */
+    private var seenFloods = SeenWindowCache()
+
+    /** Per-node flood sequence counter for frames originated by this node. */
+    private var floodSeq = AtomicInteger(0)
+
     // --- Group membership ---
 
     /** Set of [GroupId]s this node belongs to. */
@@ -138,6 +146,10 @@ class KiroRouter {
     private val _incomingMulticast = MutableSharedFlow<MulticastMessage>(extraBufferCapacity = 64)
     /** Emits a [MulticastMessage] whenever a group multicast arrives and this node is a member. */
     val incomingMulticast: SharedFlow<MulticastMessage> = _incomingMulticast
+
+    private val _incomingFlood = MutableSharedFlow<Pair<NodeId, ByteArray>>(extraBufferCapacity = 64)
+    /** Emits (srcId, payload) whenever a [Frame.FloodFrame] reaches this node. */
+    val incomingFlood: SharedFlow<Pair<NodeId, ByteArray>> = _incomingFlood
 
     private val _routes = MutableStateFlow<Map<NodeId, NeighborEntry>>(emptyMap())
     /**
@@ -195,6 +207,8 @@ class KiroRouter {
         multicastTree   = MulticastTree()
         seenMulticasts  = SeenWindowCache()
         multicastSeq    = AtomicInteger(0)
+        seenFloods      = SeenWindowCache()
+        floodSeq        = AtomicInteger(0)
         localGroups     = ConcurrentHashMap.newKeySet()
         groupRoots      = ConcurrentHashMap()
         linksMap        = ConcurrentHashMap()
@@ -358,14 +372,30 @@ class KiroRouter {
         val seq = multicastSeq.getAndIncrement().toUShort()
         seenMulticasts.markIfNew(selfId, seq)
         val frame = Frame.MulticastFrame(selfId, gid, seq, MAX_TTL, payload)
-        val links = multicastTree.allLinksFor(gid)
-        println("[SEND-MULTICAST $selfId] gid=$gid links=${links.map { it.id }}")
-        if (links.isEmpty()) {
-            println("[SEND-MULTICAST $selfId] tree is empty for gid=$gid — beacon not yet received by root or beaconLoop not running")
-        }
-        links.forEach { link ->
-            println("[SEND-MULTICAST $selfId] enqueuing on link=${link.id}")
+        multicastTree.allLinksFor(gid).forEach { link ->
             txQueue.enqueue(TxEntry(encode(frame), setOf(link), PacketFlavor.MULTICAST))
+        }
+    }
+
+    // -------------------------------------------------------------------------
+    // Public API — Flood
+    // -------------------------------------------------------------------------
+
+    /**
+     * Sends [payload] to every reachable node in the mesh without requiring group
+     * membership or a spanning tree. The frame is relayed by every intermediate node
+     * on all links except the one it arrived on. Relay suppression (identical to OGM
+     * jitter) limits redundant transmissions in dense networks.
+     *
+     * Suitable for distress signals or any message that must reach all nodes.
+     */
+    suspend fun flood(payload: ByteArray, respectSilent: Boolean = false) {
+        if (respectSilent && silent) return
+        val seq = floodSeq.getAndIncrement().toUShort()
+        seenFloods.markIfNew(selfId, seq)
+        val frame = Frame.FloodFrame(selfId, seq, MAX_TTL, payload)
+        linksMap.values.forEach { link ->
+            txQueue.enqueue(TxEntry(encode(frame), setOf(link), PacketFlavor.FLOOD))
         }
     }
 
@@ -414,7 +444,8 @@ class KiroRouter {
                     flavor        = PacketFlavor.OGM
                 ))
             }
-            delay(link.ogmInterval)
+            val jitterMs = link.ogmInterval.inWholeMilliseconds / 10
+            delay(link.ogmInterval.inWholeMilliseconds + Random.nextLong(-jitterMs, jitterMs))
         }
     }
 
@@ -452,22 +483,13 @@ class KiroRouter {
      * becomes a leaf again and resumes beaconing on the next tick.
      */
     private suspend fun beaconLoop(gid: GroupId, beaconInterval: Duration) {
-        println("[BEACON-LOOP $selfId] started for gid=$gid interval=$beaconInterval")
         while (gid in localGroups) {
             if (multicastTree.hasActiveDownstream(gid, beaconInterval * 2)) {
-                println("[BEACON-LOOP $selfId] suppressed — downstream active for gid=$gid")
                 delay(beaconInterval)
                 continue
             }
-            val activeRoot = resolveActiveRoot(gid) ?: run {
-                println("[BEACON-LOOP $selfId] no active root for gid=$gid (groupRoots=${groupRoots[gid]}), retrying in 1s")
-                delay(1.seconds); return@run null
-            } ?: continue
-            val route = neighborTable[activeRoot] ?: run {
-                println("[BEACON-LOOP $selfId] no route to root=$activeRoot for gid=$gid (neighborTable keys=${neighborTable.keys}), retrying in 1s")
-                delay(1.seconds); return@run null
-            } ?: continue
-            println("[BEACON-LOOP $selfId] sending beacon gid=$gid root=$activeRoot nextHop=${route.nextHop} link=${route.link.id}")
+            val activeRoot = resolveActiveRoot(gid) ?: run { delay(1.seconds); return@run null } ?: continue
+            val route = neighborTable[activeRoot]   ?: run { delay(1.seconds); return@run null } ?: continue
             multicastTree.registerUpstream(gid, route.link)
             if (!silent) txQueue.enqueue(TxEntry(
                 frame         = encode(Frame.BeaconFrame(route.nextHop, selfId, gid, activeRoot)),
@@ -540,6 +562,7 @@ class KiroRouter {
                 is Frame.DataFrame      -> handleData(frame)
                 is Frame.BeaconFrame    -> handleBeacon(frame, link)
                 is Frame.MulticastFrame -> handleMulticast(frame, link)
+                is Frame.FloodFrame     -> handleFlood(frame, link)
                 null                    -> Unit  // malformed or unknown type
             }
         }
@@ -726,26 +749,14 @@ class KiroRouter {
      * needing to know about the group's root list.
      */
     private suspend fun handleBeacon(frame: Frame.BeaconFrame, incomingLink: Link) {
-        println("[HANDLE-BEACON $selfId] received beacon nextHop=${frame.nextHop} src=${frame.srcId} gid=${frame.groupId} root=${frame.activeRoot} link=${incomingLink.id}")
-        if (frame.nextHop != selfId) {
-            println("[HANDLE-BEACON $selfId] dropped — nextHop=${frame.nextHop} != selfId=$selfId")
-            return
-        }
+        if (frame.nextHop != selfId) return
 
-        println("[HANDLE-BEACON $selfId] registerDownstream gid=${frame.groupId} link=${incomingLink.id}")
         multicastTree.registerDownstream(frame.groupId, incomingLink)
 
-        if (frame.activeRoot == selfId) {
-            println("[HANDLE-BEACON $selfId] I am root, tree entry registered")
-            return
-        }
+        if (frame.activeRoot == selfId) return
         if (silent) return
 
-        val route = neighborTable[frame.activeRoot] ?: run {
-            println("[HANDLE-BEACON $selfId] no route to root=${frame.activeRoot}, cannot relay")
-            return
-        }
-        println("[HANDLE-BEACON $selfId] registerUpstream gid=${frame.groupId} link=${route.link.id} and relaying to nextHop=${route.nextHop}")
+        val route = neighborTable[frame.activeRoot] ?: return
         multicastTree.registerUpstream(frame.groupId, route.link)
         txQueue.enqueue(TxEntry(
             frame         = encode(frame.copy(nextHop = route.nextHop)),
@@ -775,6 +786,47 @@ class KiroRouter {
         val relayed = frame.copy(ttl = (frame.ttl - 1u).toUByte())
         multicastTree.linksFor(frame.groupId, except = incomingLink).forEach { outLink ->
             txQueue.enqueue(TxEntry(encode(relayed), setOf(outLink), PacketFlavor.MULTICAST))
+        }
+    }
+
+    /**
+     * Handles an incoming [Frame.FloodFrame]:
+     *  1. Deduplicates via [seenFloods] — drops if already seen.
+     *  2. Delivers to [incomingFlood].
+     *  3. Relays on all links except [incomingLink] using OGM-style jitter suppression:
+     *     waits a random fraction of the link's OGM interval, then relays with
+     *     probability 1/hearingCount so dense networks don't amplify transmissions.
+     */
+    private suspend fun handleFlood(frame: Frame.FloodFrame, incomingLink: Link) {
+        if (frame.srcId == selfId) return
+
+        val key = frame.srcId to frame.seqNum
+        val counter = pendingRelays.computeIfAbsent(key) { AtomicInteger(0) }
+        val hearingCount = counter.incrementAndGet()
+
+        if (!seenFloods.markIfNew(frame.srcId, frame.seqNum)) {
+            pendingRelays.remove(key)
+            return
+        }
+
+        _incomingFlood.tryEmit(frame.srcId to frame.payload)
+
+        if (frame.ttl == 0u.toUByte()) {
+            pendingRelays.remove(key)
+            return
+        }
+
+        val relayed = frame.copy(ttl = (frame.ttl - 1u).toUByte())
+        val jitterMs = incomingLink.ogmInterval.inWholeMilliseconds / (8L + Random.nextLong(0L, 4L))
+
+        scope?.launch {
+            delay(jitterMs)
+            val finalCount = pendingRelays.remove(key)?.get() ?: 1
+            if (!silent && shouldRelay(finalCount)) {
+                linksMap.values.filter { it.id != incomingLink.id }.forEach { outLink ->
+                    txQueue.enqueue(TxEntry(encode(relayed), setOf(outLink), PacketFlavor.FLOOD))
+                }
+            }
         }
     }
 }
