@@ -9,8 +9,9 @@ The library runs entirely at the application layer — no kernel modules, no raw
 ## Features
 
 - **Distributed hop-by-hop routing** via periodic OGM (Originator Message) broadcasts
-- **Jitter-based relay suppression** — in a dense subnet of N neighbours, expected relays ≈ ln(N) instead of N−1
+- **Jitter-based relay suppression** — in a dense subnet of N neighbours, expected relays ≈ ln(N) instead of N−1; per-cycle ±10% interval jitter prevents phase-lock collisions on shared air links
 - **Beacon-driven multicast spanning trees** — members build the tree themselves; no network-wide flooding
+- **Flood broadcast** — delivers a frame to every reachable node without group membership or a spanning tree; uses OGM-style relay suppression; bypasses radio silence by default (distress/SOS use case)
 - **Pull-model transmit queue** with rule-based ordering and per-handle cancellation, replacement and reordering
 - **Widest-path bandwidth routing** — OGMs carry the minimum bandwidth tier of every link traversed; the router always prefers the path whose bottleneck link is widest
 - **Compact wire format** — 7 bytes for an OGM, 8 bytes for a beacon, varint-encoded payload length (no upper limit at the codec layer)
@@ -25,12 +26,12 @@ Add the dependency to your `build.gradle.kts`:
 
 ```kotlin
 dependencies {
-    implementation("systems.untangle:kiro:0.1.1")
+    implementation("systems.untangle:kiro:0.5.0")
 }
 ```
 
 Requirements:
- - **JVM 17+**
+ - **JVM 21+**
  - **Kotlin 2.3+**
  - `kotlinx-coroutines-core 1.10+`.
 
@@ -85,11 +86,11 @@ interface Link {
 
 `bandwidthBps` is the primary routing metric. Each OGM carries a running minimum of `floor(log₂(bps))` across every link it has traversed. The router always prefers the path whose bottleneck link is widest — a 3-hop all-WiFi path beats a 2-hop WiFi+LoRa path when LoRa is the bottleneck. TTL (hop count) is used only as a tiebreaker when two paths have the same bottleneck tier.
 
-`ogmInterval` controls how often OGMs are emitted and sets the jitter window for relay suppression. It also determines how quickly a missing neighbour is detected: an entry is evicted after `neighborPurgeMultiplier × ogmInterval` without a refresh.
+`ogmInterval` controls how often OGMs are emitted and sets the jitter window for relay suppression. It also determines how quickly a missing neighbour is detected: an entry is evicted after `neighborPurgeMultiplier × ogmInterval` without a refresh. A ±10% random jitter is applied to each interval cycle so that nodes starting simultaneously do not stay permanently in phase and collide on every transmission — particularly important on shared air links (LoRa, 802.11) where simultaneous transmissions corrupt each other.
 
 ### KiroRouter
 
-One instance per node. Orchestrates OGM emission, relay suppression, route table maintenance, multicast tree building, and frame forwarding.
+One instance per node. Orchestrates OGM emission, relay suppression, route table maintenance, multicast tree building, frame forwarding, and flood propagation.
 
 ```kotlin
 val router = KiroRouter()
@@ -183,15 +184,19 @@ Multicast is built on a per-group spanning tree. Members send periodic **beacons
 
 ### Creating and joining a group
 
-Group identifiers are opaque 20-bit values chosen by the application. The node designated as root joins with `roots = listOf(selfId)`; members join with `roots` pointing at the root:
+Group identifiers are opaque 20-bit values chosen by the application. Any node can be both a root and a member simultaneously — the beacon loop will beacon toward other reachable roots while the node participates as a member:
 
 ```kotlin
-// Root node — beacons flow toward it, so no beacon loop is started
 val gid = GroupId(0xA01u)   // application-assigned opaque id
+
+// Root-only node — beacons flow toward it
 router.joinGroup(gid, roots = listOf(router.selfId))
 
 // Member node — launches a beacon loop toward the root
 router.joinGroup(gid, roots = listOf(rootId), beaconInterval = 30.seconds)
+
+// Node that is both root and member (valid — beacons toward other roots)
+router.joinGroup(gid, roots = listOf(router.selfId, otherRootId))
 ```
 
 ### Sending and receiving
@@ -212,6 +217,31 @@ When the primary root goes offline, members independently select the first alter
 
 ---
 
+## Flood
+
+`flood` delivers a frame to every reachable node in the mesh without requiring group membership or a spanning tree. It uses the same OGM-style jitter relay suppression — each intermediate node waits a random fraction of the link's OGM interval before relaying, and relays with probability `1/hearingCount` in dense networks.
+
+```kotlin
+// Flood a message to all reachable nodes (ignores silent mode by default)
+router.flood(payload = "SOS".encodeToByteArray())
+
+// Optionally honour silent mode
+router.flood(payload = bytes, respectSilent = true)
+
+// Receive flood messages
+router.incomingFlood.collect { (srcId, payload) ->
+    println("flood from $srcId: ${payload.decodeToString()}")
+}
+```
+
+By default `flood` transmits even when the node is in silent mode — a node that has gone dark may still need to send a distress signal. Pass `respectSilent = true` to suppress the flood while silent.
+
+The originating node does not receive its own flood; all other reachable nodes do, including multi-hop relays.
+
+Flood frames are prioritised in the transmit queue above DATA and MULTICAST but below OGM and BEACON, so a distress signal is not delayed by queued application data while routing control traffic still gets through first.
+
+---
+
 ## Radio silence
 
 ```kotlin
@@ -224,6 +254,7 @@ While silent the node is completely dark on the wire:
 - No OGMs or beacons are emitted — the node disappears from neighbours' routing tables after their purge timeout.
 - No frames are relayed or forwarded, even for traffic not addressed to this node.
 - `send` and `sendMulticast` calls are dropped.
+- `flood` still transmits by default (pass `respectSilent = true` to suppress it).
 
 Incoming frames are still decoded and the local routing table is still updated, so the node can resume routing immediately on `unsilence()`. The OGM and beacon loops keep running at their scheduled interval, so the node re-announces itself within one OGM cycle with no burst of stale frames.
 
@@ -237,9 +268,10 @@ All outgoing frames pass through `TxQueue` — a sorted, pull-model queue shared
 
 Ordering is controlled by a composable list of `Rule` objects (each a `Comparator<TxEntry>`). The defaults are:
 
-1. `controlFirst` — OGM / BEACON before DATA / MULTICAST
-2. `olderFirst` — FIFO within a priority class
-3. `insertionOrderFirst` — strict total order tiebreaker
+1. `controlFirst` — OGM / BEACON before everything else
+2. `floodBeforeData` — FLOOD before DATA / MULTICAST
+3. `olderFirst` — FIFO within a priority class
+4. `insertionOrderFirst` — strict total order tiebreaker
 
 Custom rule lists can be injected into `TxQueue`:
 
@@ -312,6 +344,7 @@ All frames are bit-packed big-endian. Byte 0 always carries the 4-bit type tag i
 | `DataFrame` | 7 + n bytes | nextHop(12b) + src(12b) + dst(12b) + ttl(4b) + varint(len) + payload |
 | `BeaconFrame` | 8 bytes | nextHop(12b) + src(12b) + groupId(20b) + activeRoot(12b) |
 | `MulticastFrame` | 8 + n bytes | src(12b) + groupId(20b) + ttl(4b) + seqNum(16b) + varint(len) + payload |
+| `FloodFrame` | 6 + n bytes | src(12b) + seqNum(16b) + ttl(4b) + varint(len) + payload |
 
 Payload lengths use a 7-bit continuation varint: lengths ≤127 cost 1 byte, ≤16383 cost 2 bytes, ≤2097151 cost 3 bytes. No upper limit is imposed at the codec layer.
 
@@ -331,6 +364,8 @@ Payload lengths use a 7-bit continuation varint: lengths ≤127 cost 1 byte, ≤
 
 **Why activeRoot carried in BeaconFrame?** Relay nodes need no local configuration. The active root is embedded in every beacon, so any node can forward toward the correct root without knowing the group's root list.
 
+**Why does flood bypass silent mode by default?** Silent mode is designed to suppress routing participation — the node goes dark to avoid influencing the mesh. But a node that needs to send a distress signal should be able to do so regardless of its current routing posture. Passing `respectSilent = true` opts back into the normal suppression if the application requires it.
+
 ---
 
 ## UDP multicast link
@@ -347,14 +382,12 @@ val link = UdpMulticastLink(
     ogmInterval    = 2.seconds,
     bandwidthBps   = 100_000_000L,  // 100 Mbps — used as the routing metric
 )
-link.startReading(scope)
 
 val router = KiroRouter()
 router.start(scope, selfId = 1u, links = listOf(link))
-
-// When tearing down:
-link.close()
 ```
+
+When a `networkInterface` is specified, both inbound and outbound multicast are pinned to that interface. Inbound is handled by `joinGroup` (the OS only delivers packets received on that interface); outbound is handled by `setNetworkInterface` (the OS routes sent packets out of that interface). This allows two `UdpMulticastLink` instances with the same group and port to coexist on different physical interfaces without cross-contamination.
 
 Multiple instances on different ports or addresses model separate broadcast media. A node connected to two of them bridges them:
 
@@ -421,6 +454,7 @@ After a few seconds node 1 and node 3 discover each other through node 2.
 |---|---|
 | `send <dstId> <message>` | Unicast a text message to another node |
 | `mcast <groupId> <message>` | Send a multicast to a group |
+| `flood <message>` | Flood a message to all reachable nodes |
 | `join <groupId> [<rootId>]` | Join a group; omit `rootId` to join as root |
 | `leave <groupId>` | Leave a group |
 | `routes` | Print the current routing table |
