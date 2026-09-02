@@ -106,6 +106,13 @@ class KiroRouter {
      */
     private var pendingRelays = ConcurrentHashMap<Pair<NodeId, UShort>, AtomicInteger>()
 
+    /**
+     * Tracks the last time an OGM from each originator was relayed on each outgoing link.
+     * Key: (originatorId, linkId). Used to rate-limit relays to at most once per
+     * [Link.ogmInterval] per outgoing link, preventing fast-link OGM floods on slow links.
+     */
+    private var lastOgmRelayTime = ConcurrentHashMap<Pair<NodeId, String>, Instant>()
+
     // --- Multicast state ---
 
     /** Spanning tree of links per group, built from beacon relay observations. */
@@ -203,7 +210,8 @@ class KiroRouter {
         neighborTable   = ConcurrentHashMap()
         seenOgms        = SeenWindowCache()
         ogmSeq          = AtomicInteger(0)
-        pendingRelays   = ConcurrentHashMap()
+        pendingRelays      = ConcurrentHashMap()
+        lastOgmRelayTime   = ConcurrentHashMap()
         multicastTree   = MulticastTree()
         seenMulticasts  = SeenWindowCache()
         multicastSeq    = AtomicInteger(0)
@@ -573,7 +581,7 @@ class KiroRouter {
     // -------------------------------------------------------------------------
 
     /**
-     * Processes a received OGM with jitter-based relay suppression.
+     * Processes a received OGM with jitter-based relay suppression and per-link rate limiting.
      *
      * Flow:
      *  1. Drop our own OGMs (echoed back by other nodes).
@@ -590,6 +598,11 @@ class KiroRouter {
      *     relay it), only ~1/count of them actually transmit, saving bandwidth.
      *  6. Relay is suppressed on the incoming [link] to avoid echoing back to the
      *     sender (waste) and to nodes that already heard the original.
+     *  7. Before enqueuing on each outgoing link, a rate-limit check ([lastOgmRelayTime])
+     *     ensures OGMs from the same originator are not relayed onto that link more
+     *     often than once per [Link.ogmInterval]. This prevents a fast upstream link
+     *     from flooding a slower outgoing link with relayed OGMs at the fast link's
+     *     origination rate rather than the slow link's own cadence.
      */
     private suspend fun handleOgm(ogm: Ogm, link: Link) {
         if (ogm.originatorId == selfId) return
@@ -624,7 +637,7 @@ class KiroRouter {
         // as the new bottleneck minimum.
         val relayBase = ogm.copy(senderId = selfId, ttl = (ogm.ttl - 1u).toUByte())
 
-        // Jitter window: a random fraction of the link's OGM interval.
+        // Jitter window: a random fraction of the incoming link's OGM interval.
         // Dividing by a random value in [8, 11] gives roughly 9–12.5% of the interval,
         // which is long enough for neighbouring nodes' relays to arrive and increment
         // the hearing count, but short relative to the OGM interval itself.
@@ -639,10 +652,16 @@ class KiroRouter {
                 // Skipping the incoming link avoids pointless retransmission back
                 // toward the sender and halves bandwidth use in sparse chains.
                 linksMap.values.filter { it.id != link.id }.forEach { outLink ->
-                    val relay = relayBase.copy(
-                        minBandwidthTier = minOf(ogm.minBandwidthTier, outLink.bandwidthTier)
-                    )
-                    txQueue.enqueue(TxEntry(encode(Frame.OgmFrame(relay)), setOf(outLink), PacketFlavor.OGM))
+                    val rateKey = ogm.originatorId to outLink.id
+                    val now = Instant.now()
+                    val lastMs = lastOgmRelayTime[rateKey]?.toEpochMilli() ?: 0L
+                    if (now.toEpochMilli() - lastMs >= outLink.ogmInterval.inWholeMilliseconds) {
+                        lastOgmRelayTime[rateKey] = now
+                        val relay = relayBase.copy(
+                            minBandwidthTier = minOf(ogm.minBandwidthTier, outLink.bandwidthTier)
+                        )
+                        txQueue.enqueue(TxEntry(encode(Frame.OgmFrame(relay)), setOf(outLink), PacketFlavor.OGM))
+                    }
                 }
             }
         }

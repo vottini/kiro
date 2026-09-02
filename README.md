@@ -88,6 +88,8 @@ interface Link {
 
 `ogmInterval` controls how often OGMs are emitted and sets the jitter window for relay suppression. It also determines how quickly a missing neighbour is detected: an entry is evicted after `neighborPurgeMultiplier × ogmInterval` without a refresh. A ±10% random jitter is applied to each interval cycle so that nodes starting simultaneously do not stay permanently in phase and collide on every transmission — particularly important on shared air links (LoRa, 802.11) where simultaneous transmissions corrupt each other.
 
+`ogmInterval` also gates relay throughput. When a node bridges a fast link (short interval) to a slow link (long interval), it will never relay OGMs from any given originator onto the slow link more often than once per the slow link's `ogmInterval` — regardless of how frequently those OGMs arrive from the fast side. This prevents fast upstream links from flooding slower outgoing links with routing control traffic.
+
 ### KiroRouter
 
 One instance per node. Orchestrates OGM emission, relay suppression, route table maintenance, multicast tree building, frame forwarding, and flood propagation.
@@ -363,6 +365,8 @@ Payload lengths use a 7-bit continuation varint: lengths ≤127 cost 1 byte, ≤
 **Why separate upstream and downstream links in MulticastTree?** It enables two optimisations: leaf suppression (a relay whose downstream members are actively beaconing does not need to send its own beacon) and immediate upstream replacement (when the best route to the root changes, the old upstream link is discarded atomically, preventing duplicate multicast transmissions during reroutes).
 
 **Why activeRoot carried in BeaconFrame?** Relay nodes need no local configuration. The active root is embedded in every beacon, so any node can forward toward the correct root without knowing the group's root list.
+
+**Why rate-limit OGM relays per outgoing link?** In a heterogeneous mesh a single node may bridge a fast link (e.g. WiFi, 5 s interval) to a slow link (e.g. LoRa, 90 s interval). Without a rate limit, every OGM from a fast-side originator would be relayed onto the slow link at the fast link's cadence — 18 routing frames per 90 s window instead of 1. The relay rate limiter (`lastOgmRelayTime`) caps relays to at most one per `ogmInterval` of the outgoing link, so the slow medium never sees more OGM traffic than it would generate itself. The jitter-based 1/N suppression still fires first and may suppress the relay entirely; the rate limiter is a backstop for the case where suppression does not fire (sparse chains where `hearingCount` is always 1).
 
 **Why does flood bypass silent mode by default?** Silent mode is designed to suppress routing participation — the node goes dark to avoid influencing the mesh. But a node that needs to send a distress signal should be able to do so regardless of its current routing posture. Passing `respectSilent = true` opts back into the normal suppression if the application requires it.
 
