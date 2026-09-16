@@ -14,7 +14,7 @@ The library runs entirely at the application layer — no kernel modules, no raw
 - **Flood broadcast** — delivers a frame to every reachable node without group membership or a spanning tree; uses OGM-style relay suppression; bypasses radio silence by default (distress/SOS use case)
 - **Pull-model transmit queue** with rule-based ordering and per-handle cancellation, replacement and reordering
 - **Widest-path bandwidth routing** — OGMs carry the minimum bandwidth tier of every link traversed; the router always prefers the path whose bottleneck link is widest
-- **Compact wire format** — 7 bytes for an OGM, 8 bytes for a beacon, varint-encoded payload length (no upper limit at the codec layer)
+- **Compact wire format** — 8 bytes for an OGM, 8 bytes for a beacon, varint-encoded payload length (no upper limit at the codec layer)
 - **Fully coroutine-native** — every loop suspends instead of polling; slow radios never block fast ones
 
 ---

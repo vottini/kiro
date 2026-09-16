@@ -68,7 +68,11 @@ fun Flow<Map<NodeId, NeighborEntry>>.asRouteSummaryFlow(): Flow<Map<NodeId, Rout
         val now = Instant.now()
         table.mapValues { (_, entry) ->
             val ageMs = java.time.Duration.between(entry.lastSeen, now).toMillis()
-            val status = if (ageMs <= entry.link.ogmInterval.inWholeMilliseconds) LinkStatus.GOOD else LinkStatus.WARNING
+            val intervalMs = if (entry.originatorIntervalSecs > 0u)
+                entry.originatorIntervalSecs.toLong() * 1000L
+            else
+                entry.link.ogmInterval.inWholeMilliseconds
+            val status = if (ageMs <= intervalMs) LinkStatus.GOOD else LinkStatus.WARNING
             RouteSummary(entry.nextHop, entry.link.id, entry.minBandwidthTier, status)
         }
     }.distinctUntilChanged()

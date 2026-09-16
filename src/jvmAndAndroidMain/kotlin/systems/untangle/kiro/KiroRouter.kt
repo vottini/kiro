@@ -442,12 +442,13 @@ class KiroRouter {
      * of which link the OGM went out on.
      */
     private suspend fun ogmLoop(link: Link) {
-        val tier = link.bandwidthTier
+        val tier         = link.bandwidthTier
+        val intervalSecs = link.ogmInterval.inWholeSeconds.coerceIn(0L, 255L).toUByte()
         while (true) {
             if (!silent) {
                 val seq = ogmSeq.getAndIncrement().toUShort()
                 txQueue.enqueue(TxEntry(
-                    frame         = encode(Frame.OgmFrame(Ogm(selfId, selfId, seq, MAX_TTL, tier))),
+                    frame         = encode(Frame.OgmFrame(Ogm(selfId, selfId, seq, MAX_TTL, tier, intervalSecs))),
                     eligibleLinks = setOf(link),
                     flavor        = PacketFlavor.OGM
                 ))
@@ -535,8 +536,11 @@ class KiroRouter {
             delay(3.seconds)
             val now = Instant.now()
             val removed = neighborTable.entries.removeIf { (_, entry) ->
-                val expiryMs = entry.link.ogmInterval.inWholeMilliseconds * neighborPurgeMultiplier
-                entry.lastSeen.plusMillis(expiryMs).isBefore(now)
+                val intervalMs = if (entry.originatorIntervalSecs > 0u)
+                    entry.originatorIntervalSecs.toLong() * 1000L
+                else
+                    entry.link.ogmInterval.inWholeMilliseconds
+                entry.lastSeen.plusMillis(intervalMs * neighborPurgeMultiplier).isBefore(now)
             }
             if (removed) _routes.value = neighborTable.toMap()
         }
@@ -652,13 +656,25 @@ class KiroRouter {
                 // Skipping the incoming link avoids pointless retransmission back
                 // toward the sender and halves bandwidth use in sparse chains.
                 linksMap.values.filter { it.id != link.id }.forEach { outLink ->
-                    val rateKey = ogm.originatorId to outLink.id
-                    val now = Instant.now()
-                    val lastMs = lastOgmRelayTime[rateKey]?.toEpochMilli() ?: 0L
-                    if (now.toEpochMilli() - lastMs >= outLink.ogmInterval.inWholeMilliseconds) {
-                        lastOgmRelayTime[rateKey] = now
+                    // Rate-limit only applies to slow links (interval ≥ 1 s). Sub-second links
+                    // are fast enough that relay timing is already bounded by jitter; applying
+                    // the limiter there would risk stalling convergence on boundary-condition arrivals.
+                    val intervalMs = outLink.ogmInterval.inWholeMilliseconds
+                    val allowed = if (intervalMs < 1000L) {
+                        true
+                    } else {
+                        val rateKey = ogm.originatorId to outLink.id
+                        val now = Instant.now()
+                        val lastMs = lastOgmRelayTime[rateKey]?.toEpochMilli() ?: 0L
+                        (now.toEpochMilli() - lastMs >= intervalMs).also { pass ->
+                            if (pass) lastOgmRelayTime[rateKey] = now
+                        }
+                    }
+                    if (allowed) {
+                        val outIntervalSecs = outLink.ogmInterval.inWholeSeconds.coerceIn(0L, 255L).toUByte()
                         val relay = relayBase.copy(
-                            minBandwidthTier = minOf(ogm.minBandwidthTier, outLink.bandwidthTier)
+                            minBandwidthTier = minOf(ogm.minBandwidthTier, outLink.bandwidthTier),
+                            ogmIntervalSecs  = maxOf(ogm.ogmIntervalSecs, outIntervalSecs),
                         )
                         txQueue.enqueue(TxEntry(encode(Frame.OgmFrame(relay)), setOf(outLink), PacketFlavor.OGM))
                     }
@@ -703,7 +719,7 @@ class KiroRouter {
      *
      *  3. **Worse path, different next hop or link**: a lower-quality alternative exists
      *     but gives no evidence the current next hop is still forwarding. Leave unchanged.
-     *     After [neighborPurgeMultiplier] × [Link.ogmInterval] of silence the entry
+     *     After [neighborPurgeMultiplier] × [Ogm.ogmIntervalSecs] of silence the entry
      *     expires and the alternative installs itself.
      */
     private fun updateNeighborTable(ogm: Ogm, link: Link) {
@@ -714,15 +730,16 @@ class KiroRouter {
                 || ogm.minBandwidthTier > current.minBandwidthTier
                 || (ogm.minBandwidthTier == current.minBandwidthTier && ogm.ttl >= current.bestTtl) ->
                     NeighborEntry(
-                        nextHop          = ogm.senderId,
-                        link             = link,
-                        minBandwidthTier = ogm.minBandwidthTier,
-                        bestTtl          = ogm.ttl,
-                        lastSeq          = ogm.seqNum,
-                        lastSeen         = now
+                        nextHop                  = ogm.senderId,
+                        link                     = link,
+                        minBandwidthTier         = ogm.minBandwidthTier,
+                        bestTtl                  = ogm.ttl,
+                        lastSeq                  = ogm.seqNum,
+                        lastSeen                 = now,
+                        originatorIntervalSecs   = ogm.ogmIntervalSecs,
                     )
                 ogm.senderId == current.nextHop && link.id == current.link.id ->
-                    current.copy(lastSeq = ogm.seqNum, lastSeen = now)
+                    current.copy(lastSeq = ogm.seqNum, lastSeen = now, originatorIntervalSecs = ogm.ogmIntervalSecs)
                 else -> current
             }
         }

@@ -21,6 +21,14 @@ package systems.untangle.kiro
  *   each relay updates it to `min(current, outgoingLink.bandwidthTier)`. The router
  *   stores the highest value seen for each originator, selecting the path whose
  *   bottleneck link is widest.
+ * @property ogmIntervalSecs Running maximum of [Link.ogmInterval] values (in whole seconds,
+ *   clamped to 0–255) across every link this OGM has traversed. Set to the originator's
+ *   link interval; each relay updates it to `max(current, outgoingLink.ogmInterval)`.
+ *   Mirrors [minBandwidthTier] but in the opposite direction: captures the slowest link
+ *   along the path — the bottleneck for OGM delivery frequency. Receiving nodes use this
+ *   to size the purge timeout so that a route relayed through a slow link is not evicted
+ *   on a faster timetable than OGMs actually arrive. 0 means all links were sub-second;
+ *   receivers fall back to their local link's interval in that case.
  */
 data class Ogm(
     val originatorId: NodeId,
@@ -28,6 +36,7 @@ data class Ogm(
     val seqNum: UShort,
     val ttl: UByte,
     val minBandwidthTier: UByte,
+    val ogmIntervalSecs: UByte,
 )
 
 /**

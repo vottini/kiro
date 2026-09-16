@@ -18,8 +18,9 @@ class CodecTest {
         sendId: UShort = 2u,
         seq: UShort = 100u,
         ttl: UByte = 10u,
-        minBandwidthTier: UByte = 26u
-    ) = Frame.OgmFrame(Ogm(origId, sendId, seq, ttl, minBandwidthTier))
+        minBandwidthTier: UByte = 26u,
+        ogmIntervalSecs: UByte = 5u,
+    ) = Frame.OgmFrame(Ogm(origId, sendId, seq, ttl, minBandwidthTier, ogmIntervalSecs))
 
     private fun data(
         nextHop: UShort = 3u,
@@ -63,8 +64,14 @@ class CodecTest {
             assertEquals(f, roundTrip(f))
         }
 
-        @Test fun `encoded length is 7 bytes`() {
-            assertEquals(7, encode(ogm()).size)
+        @Test fun `encoded length is 8 bytes`() {
+            assertEquals(8, encode(ogm()).size)
+        }
+
+        @Test fun `round-trip ogmIntervalSecs boundary values`() {
+            assertEquals(ogm(ogmIntervalSecs = 1u),   roundTrip(ogm(ogmIntervalSecs = 1u)))
+            assertEquals(ogm(ogmIntervalSecs = 255u),  roundTrip(ogm(ogmIntervalSecs = 255u)))
+            assertEquals(ogm(ogmIntervalSecs = 90u),   roundTrip(ogm(ogmIntervalSecs = 90u)))
         }
 
         @Test fun `type nibble is TYPE_OGM (0)`() {

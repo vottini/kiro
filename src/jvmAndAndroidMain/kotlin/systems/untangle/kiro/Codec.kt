@@ -35,10 +35,10 @@ private const val TYPE_FLOOD     = 4
  * ## Wire layouts (sizes in bytes; all multi-byte integers big-endian)
  *
  * ```
- * OGM       7    B0=[type:4|origId[11:8]:4]       B1=origId[7:0]
+ * OGM       8    B0=[type:4|origId[11:8]:4]       B1=origId[7:0]
  *                B2=[sendId[11:8]:4|ttl[3:0]:4]    B3=sendId[7:0]
  *                B4=seqNum[15:8]                    B5=seqNum[7:0]
- *                B6=minBandwidthTier[7:0]
+ *                B6=minBandwidthTier[7:0]           B7=ogmIntervalSecs[7:0]
  *
  * DATA      7+n  B0=[type:4|nextHop[11:8]:4]       B1=nextHop[7:0]
  *                B2=[srcId[11:8]:4|dstId[11:8]:4]  B3=srcId[7:0]   B4=dstId[7:0]
@@ -76,7 +76,7 @@ fun encode(frame: Frame): ByteArray = when (frame) {
 }
 
 /**
- * OGM: 7 bytes.
+ * OGM: 8 bytes.
  *
  * B0: [type:4|origId[11:8]:4]
  * B1: origId[7:0]
@@ -85,14 +85,16 @@ fun encode(frame: Frame): ByteArray = when (frame) {
  * B4: seqNum[15:8]
  * B5: seqNum[7:0]
  * B6: minBandwidthTier[7:0]
+ * B7: ogmIntervalSecs[7:0]  (originator's link interval in whole seconds, clamped 1–255)
  */
 private fun encodeOgm(frame: Frame.OgmFrame): ByteArray {
-    val ogm    = frame.ogm
-    val origId = ogm.originatorId.toInt()      and 0xFFF
-    val sendId = ogm.senderId.toInt()           and 0xFFF
-    val ttl    = ogm.ttl.toInt()                and 0xF
-    val seq    = ogm.seqNum.toInt()             and 0xFFFF
-    val bwTier = ogm.minBandwidthTier.toInt()   and 0xFF
+    val ogm      = frame.ogm
+    val origId   = ogm.originatorId.toInt()    and 0xFFF
+    val sendId   = ogm.senderId.toInt()         and 0xFFF
+    val ttl      = ogm.ttl.toInt()              and 0xF
+    val seq      = ogm.seqNum.toInt()           and 0xFFFF
+    val bwTier   = ogm.minBandwidthTier.toInt() and 0xFF
+    val interval = ogm.ogmIntervalSecs.toInt()  and 0xFF
     return byteArrayOf(
         ((TYPE_OGM shl 4) or (origId ushr 8)).toByte(),
         (origId and 0xFF).toByte(),
@@ -100,7 +102,8 @@ private fun encodeOgm(frame: Frame.OgmFrame): ByteArray {
         (sendId and 0xFF).toByte(),
         (seq ushr 8).toByte(),
         (seq and 0xFF).toByte(),
-        bwTier.toByte()
+        bwTier.toByte(),
+        interval.toByte()
     )
 }
 
@@ -301,19 +304,21 @@ fun decode(raw: ByteArray): Frame? {
 }
 
 private fun decodeOgm(raw: ByteArray, b0: Int): Frame? {
-    if (raw.size < 7) return null
-    val origId = ((b0 and 0xF) shl 8) or (raw[1].toInt() and 0xFF)
-    val b2     = raw[2].toInt() and 0xFF
-    val sendId = ((b2 ushr 4) shl 8) or (raw[3].toInt() and 0xFF)
-    val ttl    = (b2 and 0xF).toUByte()
-    val seqNum = (((raw[4].toInt() and 0xFF) shl 8) or (raw[5].toInt() and 0xFF)).toUShort()
-    val bwTier = (raw[6].toInt() and 0xFF).toUByte()
+    if (raw.size < 8) return null
+    val origId   = ((b0 and 0xF) shl 8) or (raw[1].toInt() and 0xFF)
+    val b2       = raw[2].toInt() and 0xFF
+    val sendId   = ((b2 ushr 4) shl 8) or (raw[3].toInt() and 0xFF)
+    val ttl      = (b2 and 0xF).toUByte()
+    val seqNum   = (((raw[4].toInt() and 0xFF) shl 8) or (raw[5].toInt() and 0xFF)).toUShort()
+    val bwTier   = (raw[6].toInt() and 0xFF).toUByte()
+    val interval = (raw[7].toInt() and 0xFF).toUByte()
     return Frame.OgmFrame(Ogm(
         originatorId     = origId.toUShort(),
         senderId         = sendId.toUShort(),
         seqNum           = seqNum,
         ttl              = ttl,
         minBandwidthTier = bwTier,
+        ogmIntervalSecs  = interval,
     ))
 }
 
