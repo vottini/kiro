@@ -20,6 +20,9 @@ import kotlin.time.Duration.Companion.seconds
 /** Maximum TTL assigned to newly created OGMs and data frames. */
 const val MAX_TTL: UByte = 15u
 
+/** Routing entry in the gateway table: the mesh node that announced an external ID and when. */
+private data class GatewayEntry(val gatewayId: NodeId, val lastSeen: Instant, val intervalSecs: Int)
+
 /**
  * Payload delivered to [KiroRouter.incomingMulticast] collectors when a
  * [Frame.MulticastFrame] is received and this node is a member of the target group.
@@ -79,6 +82,8 @@ class KiroRouter {
         private set
     var neighborPurgeMultiplier: Int = 3
         private set
+    var gatewayIntervalMultiplier: Int = 5
+        private set
 
     /** Live set of active links. Returns a snapshot; safe to call from any thread. */
     val links: List<Link> get() = linksMap.values.toList()
@@ -131,6 +136,39 @@ class KiroRouter {
 
     /** Per-node flood sequence counter for frames originated by this node. */
     private var floodSeq = AtomicInteger(0)
+
+    // --- Gateway state ---
+
+    /** External NodeIds that this node announces as reachable through itself. */
+    private var externalIds = ConcurrentHashMap.newKeySet<NodeId>()
+
+    /** Per-node sequence counter for gateway announcement frames. */
+    private var gatewaySeq = AtomicInteger(0)
+
+    /** Deduplicates gateway frames so each (srcId, seqNum) is processed and relayed at most once. */
+    private var seenGateway = SeenWindowCache()
+
+    /**
+     * Tracks the last time a gateway announcement from each originator was relayed on each
+     * outgoing link. Used for the same per-link rate limiting as OGM relays.
+     */
+    private var lastGatewayRelayTime = ConcurrentHashMap<Pair<NodeId, String>, Instant>()
+
+    /** Per-originator relay counters during the jitter window for gateway frames. */
+    private var pendingGatewayRelays = ConcurrentHashMap<Pair<NodeId, UShort>, AtomicInteger>()
+
+    /**
+     * Maps each known external NodeId to the mesh node that announced it.
+     * Updated whenever a [Frame.GatewayFrame] is received.
+     */
+    private var gatewayTable = ConcurrentHashMap<NodeId, GatewayEntry>()
+
+    private val _gatewayRoutes = MutableStateFlow<Map<NodeId, NodeId>>(emptyMap())
+    /**
+     * Live view of the gateway table: external NodeId → gateway mesh NodeId.
+     * Emits a new snapshot whenever an entry is added or evicted.
+     */
+    val gatewayRoutes: StateFlow<Map<NodeId, NodeId>> = _gatewayRoutes.asStateFlow()
 
     // --- Group membership ---
 
@@ -196,31 +234,40 @@ class KiroRouter {
         links: List<Link>,
         txQueue: TxQueue = TxQueue(),
         staleThreshold: Duration = 90.seconds,
-        neighborPurgeMultiplier: Int = 3
+        neighborPurgeMultiplier: Int = 3,
+        gatewayIntervalMultiplier: Int = 5
     ) {
         stop()  // cancel any previous run before reconfiguring
 
-        this.selfId                  = selfId
-        this.txQueue                 = txQueue
-        this.staleThreshold          = staleThreshold
-        this.neighborPurgeMultiplier = neighborPurgeMultiplier
-        this.silent                  = false
+        this.selfId                    = selfId
+        this.txQueue                   = txQueue
+        this.staleThreshold            = staleThreshold
+        this.neighborPurgeMultiplier   = neighborPurgeMultiplier
+        this.gatewayIntervalMultiplier = gatewayIntervalMultiplier
+        this.silent                    = false
 
-        _routes.value   = emptyMap()
-        neighborTable   = ConcurrentHashMap()
-        seenOgms        = SeenWindowCache()
-        ogmSeq          = AtomicInteger(0)
-        pendingRelays      = ConcurrentHashMap()
-        lastOgmRelayTime   = ConcurrentHashMap()
-        multicastTree   = MulticastTree()
-        seenMulticasts  = SeenWindowCache()
-        multicastSeq    = AtomicInteger(0)
-        seenFloods      = SeenWindowCache()
-        floodSeq        = AtomicInteger(0)
-        localGroups     = ConcurrentHashMap.newKeySet()
-        groupRoots      = ConcurrentHashMap()
-        linksMap        = ConcurrentHashMap()
-        linkJobs        = ConcurrentHashMap()
+        _routes.value          = emptyMap()
+        _gatewayRoutes.value   = emptyMap()
+        neighborTable          = ConcurrentHashMap()
+        seenOgms               = SeenWindowCache()
+        ogmSeq                 = AtomicInteger(0)
+        pendingRelays          = ConcurrentHashMap()
+        lastOgmRelayTime       = ConcurrentHashMap()
+        multicastTree          = MulticastTree()
+        seenMulticasts         = SeenWindowCache()
+        multicastSeq           = AtomicInteger(0)
+        seenFloods             = SeenWindowCache()
+        floodSeq               = AtomicInteger(0)
+        externalIds            = ConcurrentHashMap.newKeySet()
+        gatewaySeq             = AtomicInteger(0)
+        seenGateway            = SeenWindowCache()
+        lastGatewayRelayTime   = ConcurrentHashMap()
+        pendingGatewayRelays   = ConcurrentHashMap()
+        gatewayTable           = ConcurrentHashMap()
+        localGroups            = ConcurrentHashMap.newKeySet()
+        groupRoots             = ConcurrentHashMap()
+        linksMap               = ConcurrentHashMap()
+        linkJobs               = ConcurrentHashMap()
 
         val job = Job(scope.coroutineContext[Job])
         val routerScope = CoroutineScope(scope.coroutineContext + job)
@@ -273,6 +320,7 @@ class KiroRouter {
         link.start(linkScope)
         linkScope.launch { receiveLoop(link) }
         linkScope.launch { ogmLoop(link) }
+        linkScope.launch { gatewayLoop(link) }
         linkScope.launch { txLoop(link) }
     }
 
@@ -297,7 +345,9 @@ class KiroRouter {
      */
     suspend fun send(dstId: NodeId, payload: ByteArray) {
         if (silent) return
-        val route = neighborTable[dstId] ?: return
+        val routeId = if (neighborTable.containsKey(dstId)) dstId
+                      else gatewayTable[dstId]?.gatewayId ?: return
+        val route = neighborTable[routeId] ?: return
         val frame = Frame.DataFrame(
             nextHop = route.nextHop,
             srcId   = selfId,
@@ -362,6 +412,28 @@ class KiroRouter {
         // fresh. Stale entries are pruned naturally by staleEvictionLoop once beacons stop.
         return true
     }
+
+    // -------------------------------------------------------------------------
+    // Public API — Gateway
+    // -------------------------------------------------------------------------
+
+    /**
+     * Registers [nodeId] as an external node reachable through this mesh node.
+     * The router will begin announcing [nodeId] to the mesh in [Frame.GatewayFrame]s
+     * on the next gateway loop tick for each link.
+     */
+    fun addExternalId(nodeId: NodeId) {
+        externalIds.add(nodeId)
+    }
+
+    /**
+     * Removes [nodeId] from the set of advertised external nodes.
+     * The announcement will stop on the next gateway loop tick; remote nodes will
+     * evict the entry after their purge timeout.
+     *
+     * Returns `true` if [nodeId] was registered, `false` if it was not.
+     */
+    fun removeExternalId(nodeId: NodeId): Boolean = externalIds.remove(nodeId)
 
     // -------------------------------------------------------------------------
     // Public API — Multicast
@@ -459,6 +531,29 @@ class KiroRouter {
     }
 
     /**
+     * Emits a [Frame.GatewayFrame] on [link] every [gatewayIntervalMultiplier] × [Link.ogmInterval].
+     * Skips emission when [externalIds] is empty or the node is [silent].
+     */
+    private suspend fun gatewayLoop(link: Link) {
+        val intervalSecs = link.ogmInterval.inWholeSeconds.coerceIn(0L, 255L).toUByte()
+        val cadence      = link.ogmInterval * gatewayIntervalMultiplier
+        while (true) {
+            val ids = externalIds.toList()
+            if (ids.isNotEmpty() && !silent) {
+                val seq = gatewaySeq.getAndIncrement().toUShort()
+                seenGateway.markIfNew(selfId, seq)
+                txQueue.enqueue(TxEntry(
+                    frame         = encode(Frame.GatewayFrame(selfId, seq, MAX_TTL, intervalSecs, ids)),
+                    eligibleLinks = setOf(link),
+                    flavor        = PacketFlavor.GATEWAY
+                ))
+            }
+            val jitterMs = cadence.inWholeMilliseconds / 10
+            delay(cadence.inWholeMilliseconds + Random.nextLong(-jitterMs, jitterMs))
+        }
+    }
+
+    /**
      * Pulls frames from [txQueue] for [link] and hands them to [Link.broadcast].
      * Suspends while the queue has no frames for this link, so the coroutine
      * consumes no CPU when the link is idle. The link is effectively "busy" for
@@ -543,6 +638,12 @@ class KiroRouter {
                 entry.lastSeen.plusMillis(intervalMs * neighborPurgeMultiplier).isBefore(now)
             }
             if (removed) _routes.value = neighborTable.toMap()
+
+            val gatewayRemoved = gatewayTable.entries.removeIf { (_, entry) ->
+                val intervalMs = entry.intervalSecs.toLong() * 1000L
+                entry.lastSeen.plusMillis(intervalMs * gatewayIntervalMultiplier * neighborPurgeMultiplier).isBefore(now)
+            }
+            if (gatewayRemoved) _gatewayRoutes.value = gatewayTable.mapValues { it.value.gatewayId }
         }
     }
 
@@ -575,6 +676,7 @@ class KiroRouter {
                 is Frame.BeaconFrame    -> handleBeacon(frame, link)
                 is Frame.MulticastFrame -> handleMulticast(frame, link)
                 is Frame.FloodFrame     -> handleFlood(frame, link)
+                is Frame.GatewayFrame   -> handleGateway(frame, link)
                 null                    -> Unit  // malformed or unknown type
             }
         }
@@ -861,6 +963,73 @@ class KiroRouter {
             if (!silent && shouldRelay(finalCount)) {
                 linksMap.values.filter { it.id != incomingLink.id }.forEach { outLink ->
                     txQueue.enqueue(TxEntry(encode(relayed), setOf(outLink), PacketFlavor.FLOOD))
+                }
+            }
+        }
+    }
+
+    /**
+     * Handles a [Frame.GatewayFrame] announcing external nodes reachable through [frame.srcId].
+     *
+     * Updates the local [gatewayTable] for each advertised external ID, then relays
+     * using the same jitter+1/N suppression and per-link rate limiting as OGMs, so
+     * the announcement naturally slows down when crossing from fast to slow links.
+     */
+    private suspend fun handleGateway(frame: Frame.GatewayFrame, incomingLink: Link) {
+        if (frame.srcId == selfId) return
+
+        val key     = frame.srcId to frame.seqNum
+        val counter = pendingGatewayRelays.computeIfAbsent(key) { AtomicInteger(0) }
+        val hearingCount = counter.incrementAndGet()
+
+        val now = Instant.now()
+        frame.externalIds.forEach { extId ->
+            gatewayTable[extId] = GatewayEntry(
+                gatewayId   = frame.srcId,
+                lastSeen    = now,
+                intervalSecs = frame.gatewayIntervalSecs.toInt().coerceAtLeast(1)
+            )
+        }
+        _gatewayRoutes.value = gatewayTable.mapValues { it.value.gatewayId }
+
+        if (hearingCount > 1) return
+        if (!seenGateway.markIfNew(frame.srcId, frame.seqNum)) {
+            pendingGatewayRelays.remove(key)
+            return
+        }
+        if (frame.ttl <= 1u) {
+            pendingGatewayRelays.remove(key)
+            return
+        }
+
+        val relayBase = frame.copy(ttl = (frame.ttl - 1u).toUByte())
+        val jitterMs  = incomingLink.ogmInterval.inWholeMilliseconds / (8L + Random.nextLong(0L, 4L))
+
+        scope?.launch {
+            delay(jitterMs)
+            val finalCount = pendingGatewayRelays.remove(key)?.get() ?: 1
+            if (!silent && shouldRelay(finalCount)) {
+                linksMap.values.filter { it.id != incomingLink.id }.forEach { outLink ->
+                    val intervalMs = outLink.ogmInterval.inWholeMilliseconds
+                    val allowed = if (intervalMs < 1000L) {
+                        true
+                    } else {
+                        val rateKey = frame.srcId to outLink.id
+                        val lastMs  = lastGatewayRelayTime[rateKey]?.toEpochMilli() ?: 0L
+                        (now.toEpochMilli() - lastMs >= intervalMs).also { pass ->
+                            if (pass) lastGatewayRelayTime[rateKey] = now
+                        }
+                    }
+                    if (allowed) {
+                        val outIntervalSecs = outLink.ogmInterval.inWholeSeconds.coerceIn(0L, 255L).toUByte()
+                        txQueue.enqueue(TxEntry(
+                            frame         = encode(relayBase.copy(
+                                gatewayIntervalSecs = maxOf(frame.gatewayIntervalSecs, outIntervalSecs)
+                            )),
+                            eligibleLinks = setOf(outLink),
+                            flavor        = PacketFlavor.GATEWAY
+                        ))
+                    }
                 }
             }
         }

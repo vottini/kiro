@@ -21,9 +21,9 @@ import java.util.concurrent.atomic.AtomicLong
  * application-data flavors (DATA, MULTICAST) that can tolerate queueing.
  */
 enum class PacketFlavor {
-    OGM, BEACON, MULTICAST, DATA, FLOOD;
+    OGM, BEACON, GATEWAY, MULTICAST, DATA, FLOOD;
 
-    val isControl: Boolean get() = this == OGM || this == BEACON
+    val isControl: Boolean get() = this == OGM || this == BEACON || this == GATEWAY
 }
 
 /**

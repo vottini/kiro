@@ -17,6 +17,7 @@ private const val TYPE_DATA      = 1
 private const val TYPE_BEACON    = 2
 private const val TYPE_MULTICAST = 3
 private const val TYPE_FLOOD     = 4
+private const val TYPE_GATEWAY   = 5
 
 /**
  * Serialises a [Frame] into the compact bit-packed wire format.
@@ -66,6 +67,15 @@ private const val TYPE_FLOOD     = 4
  * cost 2; ≤2097151 cost 3. No upper limit is imposed at the codec layer.
  *
  * BEACON and MULTICAST encode [GroupId] as an opaque 20-bit value (bits [19:0] of [GroupId.id]).
+ *
+ * ```
+ * GATEWAY  6+m  B0=[type:4|srcId[11:8]:4]       B1=srcId[7:0]
+ *               B2=seqNum[15:8]                   B3=seqNum[7:0]
+ *               B4=[ttl:4|count:4]                B5=gatewayIntervalSecs
+ *               // count 12-bit IDs packed as pairs into 3 bytes; odd tail uses 2 bytes
+ *               // pair (A,B): Bn=A[11:4]  Bn+1=(A[3:0]<<4)|B[11:8]  Bn+2=B[7:0]
+ *               // tail  (A):  Bn=A[11:4]  Bn+1=A[3:0]<<4
+ * ```
  */
 fun encode(frame: Frame): ByteArray = when (frame) {
     is Frame.OgmFrame       -> encodeOgm(frame)
@@ -73,6 +83,7 @@ fun encode(frame: Frame): ByteArray = when (frame) {
     is Frame.BeaconFrame    -> encodeBeacon(frame)
     is Frame.MulticastFrame -> encodeMulticast(frame)
     is Frame.FloodFrame     -> encodeFlood(frame)
+    is Frame.GatewayFrame   -> encodeGateway(frame)
 }
 
 /**
@@ -231,6 +242,84 @@ private fun encodeFlood(frame: Frame.FloodFrame): ByteArray {
     }
 }
 
+/**
+ * GATEWAY: 6 + ceil(count * 1.5) bytes.
+ *
+ * B0: [type:4|srcId[11:8]:4]
+ * B1: srcId[7:0]
+ * B2: seqNum[15:8]
+ * B3: seqNum[7:0]
+ * B4: [ttl:4|count:4]
+ * B5: gatewayIntervalSecs
+ * Packed 12-bit IDs: pairs → 3 bytes each; odd tail → 2 bytes.
+ */
+private fun encodeGateway(frame: Frame.GatewayFrame): ByteArray {
+    val srcId    = frame.srcId.toInt()               and 0xFFF
+    val seq      = frame.seqNum.toInt()              and 0xFFFF
+    val ttl      = frame.ttl.toInt()                 and 0xF
+    val count    = frame.externalIds.size            and 0xF
+    val interval = frame.gatewayIntervalSecs.toInt() and 0xFF
+    val idBytes  = (count / 2) * 3 + if (count % 2 == 1) 2 else 0
+    return ByteArray(6 + idBytes).also { b ->
+        b[0] = ((TYPE_GATEWAY shl 4) or (srcId ushr 8)).toByte()
+        b[1] = (srcId and 0xFF).toByte()
+        b[2] = (seq ushr 8).toByte()
+        b[3] = (seq and 0xFF).toByte()
+        b[4] = ((ttl shl 4) or count).toByte()
+        b[5] = interval.toByte()
+        var pos = 6
+        var i = 0
+        while (i + 1 < count) {
+            val a = frame.externalIds[i].toInt()     and 0xFFF
+            val bId = frame.externalIds[i + 1].toInt() and 0xFFF
+            b[pos]     = (a ushr 4).toByte()
+            b[pos + 1] = ((a shl 4) or (bId ushr 8)).toByte()
+            b[pos + 2] = (bId and 0xFF).toByte()
+            pos += 3; i += 2
+        }
+        if (i < count) {
+            val a = frame.externalIds[i].toInt() and 0xFFF
+            b[pos]     = (a ushr 4).toByte()
+            b[pos + 1] = (a shl 4).toByte()
+        }
+    }
+}
+
+private fun decodeGateway(raw: ByteArray, b0: Int): Frame? {
+    if (raw.size < 6) return null
+    val srcId    = ((b0 and 0xF) shl 8) or (raw[1].toInt() and 0xFF)
+    val seq      = (((raw[2].toInt() and 0xFF) shl 8) or (raw[3].toInt() and 0xFF)).toUShort()
+    val b4       = raw[4].toInt() and 0xFF
+    val ttl      = (b4 ushr 4).toUByte()
+    val count    = b4 and 0xF
+    val interval = (raw[5].toInt() and 0xFF).toUByte()
+    val idBytes  = (count / 2) * 3 + if (count % 2 == 1) 2 else 0
+    if (raw.size < 6 + idBytes) return null
+    val ids = mutableListOf<NodeId>()
+    var pos = 6
+    var i = 0
+    while (i + 1 < count) {
+        val p0 = raw[pos].toInt()     and 0xFF
+        val p1 = raw[pos + 1].toInt() and 0xFF
+        val p2 = raw[pos + 2].toInt() and 0xFF
+        ids.add(((p0 shl 4) or (p1 ushr 4)).toUShort())
+        ids.add((((p1 and 0xF) shl 8) or p2).toUShort())
+        pos += 3; i += 2
+    }
+    if (i < count) {
+        val p0 = raw[pos].toInt()     and 0xFF
+        val p1 = raw[pos + 1].toInt() and 0xFF
+        ids.add(((p0 shl 4) or (p1 ushr 4)).toUShort())
+    }
+    return Frame.GatewayFrame(
+        srcId                = srcId.toUShort(),
+        seqNum               = seq,
+        ttl                  = ttl,
+        gatewayIntervalSecs  = interval,
+        externalIds          = ids
+    )
+}
+
 private fun decodeFlood(raw: ByteArray, b0: Int): Frame? {
     if (raw.size < 6) return null
     val srcId  = ((b0 and 0xF) shl 8) or (raw[1].toInt() and 0xFF)
@@ -299,6 +388,7 @@ fun decode(raw: ByteArray): Frame? {
         TYPE_BEACON    -> decodeBeacon(raw, b0)
         TYPE_MULTICAST -> decodeMulticast(raw, b0)
         TYPE_FLOOD     -> decodeFlood(raw, b0)
+        TYPE_GATEWAY   -> decodeGateway(raw, b0)
         else -> null
     }
 }

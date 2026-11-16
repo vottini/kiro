@@ -152,6 +152,28 @@ sealed class Frame {
     }
 
     /**
+     * Announces that this node is a gateway to a set of external nodes that are not
+     * part of the mesh but can be reached through it. Flooded through the mesh with
+     * jitter-based relay suppression and per-link rate limiting identical to OGMs,
+     * so it naturally slows down when crossing from fast to slow links.
+     *
+     * @property srcId The gateway node originating this announcement (stays constant across hops).
+     * @property seqNum Per-originator sequence number for deduplication.
+     * @property ttl Decremented at each relay hop; prevents indefinite propagation.
+     * @property gatewayIntervalSecs Running maximum of [Link.ogmInterval] values (in whole
+     *   seconds) across every link this frame has traversed, so receiving nodes can size their
+     *   eviction timeout to the slowest link along the path.
+     * @property externalIds The external node IDs reachable through [srcId].
+     */
+    data class GatewayFrame(
+        val srcId: NodeId,
+        val seqNum: UShort,
+        val ttl: UByte,
+        val gatewayIntervalSecs: UByte,
+        val externalIds: List<NodeId>
+    ) : Frame()
+
+    /**
      * A unicast data frame routed hop-by-hop through the mesh.
      * Each intermediate node looks up [dstId] in its neighbour table and rewrites
      * [nextHop] to the appropriate next relay before re-enqueueing on the correct link.

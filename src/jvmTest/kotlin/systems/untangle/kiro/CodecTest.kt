@@ -45,6 +45,14 @@ class CodecTest {
         payload: ByteArray = byteArrayOf(0xAA.toByte(), 0xBB.toByte())
     ) = Frame.MulticastFrame(src, gid, seq, ttl, payload)
 
+    private fun gateway(
+        src: UShort = 10u,
+        seq: UShort = 7u,
+        ttl: UByte = 12u,
+        intervalSecs: UByte = 10u,
+        externalIds: List<NodeId> = listOf(100u, 200u)
+    ) = Frame.GatewayFrame(src, seq, ttl, intervalSecs, externalIds)
+
     // ── OGM ──────────────────────────────────────────────────────────────────
 
     @Nested inner class OgmFrameTests {
@@ -234,6 +242,82 @@ class CodecTest {
         }
     }
 
+    // ── GatewayFrame ─────────────────────────────────────────────────────────
+
+    @Nested inner class GatewayFrameTests {
+
+        @Test fun `round-trip two IDs (even count)`() {
+            assertEquals(gateway(), roundTrip(gateway()))
+        }
+
+        @Test fun `round-trip one ID (odd count)`() {
+            val f = gateway(externalIds = listOf(42u))
+            assertEquals(f, roundTrip(f))
+        }
+
+        @Test fun `round-trip three IDs (odd count)`() {
+            val f = gateway(externalIds = listOf(1u, 2u, 3u))
+            assertEquals(f, roundTrip(f))
+        }
+
+        @Test fun `round-trip zero IDs`() {
+            val f = gateway(externalIds = emptyList())
+            assertEquals(f, roundTrip(f))
+        }
+
+        @Test fun `round-trip max field values`() {
+            val f = gateway(
+                src         = 0xFFFu,
+                seq         = 0xFFFFu,
+                ttl         = 15u,
+                intervalSecs = 255u,
+                externalIds = listOf(0xFFFu, 0xFFFu)
+            )
+            assertEquals(f, roundTrip(f))
+        }
+
+        @Test fun `round-trip zero IDs with zero src and seq`() {
+            val f = gateway(src = 0u, seq = 0u, ttl = 0u, intervalSecs = 0u, externalIds = emptyList())
+            assertEquals(f, roundTrip(f))
+        }
+
+        @Test fun `12-bit IDs are preserved exactly`() {
+            val f = gateway(externalIds = listOf(0xABCu, 0x123u))
+            val decoded = roundTrip(f) as Frame.GatewayFrame
+            assertEquals(listOf(0xABCu.toUShort(), 0x123u.toUShort()), decoded.externalIds)
+        }
+
+        @Test fun `encoded length for zero IDs is 6 bytes`() {
+            assertEquals(6, encode(gateway(externalIds = emptyList())).size)
+        }
+
+        @Test fun `encoded length for one ID is 8 bytes`() {
+            assertEquals(8, encode(gateway(externalIds = listOf(1u))).size)
+        }
+
+        @Test fun `encoded length for two IDs is 9 bytes`() {
+            assertEquals(9, encode(gateway(externalIds = listOf(1u, 2u))).size)
+        }
+
+        @Test fun `encoded length for three IDs is 11 bytes`() {
+            assertEquals(11, encode(gateway(externalIds = listOf(1u, 2u, 3u))).size)
+        }
+
+        @Test fun `type nibble is TYPE_GATEWAY (5)`() {
+            assertEquals(5, (encode(gateway())[0].toInt() and 0xFF) ushr 4)
+        }
+
+        @Test fun `truncated frame decodes to null`() {
+            assertNull(decode(encode(gateway()).copyOf(5)))
+        }
+
+        @Test fun `truncated ID section decodes to null`() {
+            // 2 IDs declared but only 1 byte of ID data present
+            val raw = encode(gateway(externalIds = listOf(1u, 2u))).copyOf(7)
+            assertNull(decode(raw))
+        }
+    }
+
     // ── decode edge cases ─────────────────────────────────────────────────────
 
     @Nested inner class DecodeEdgeCases {
@@ -243,12 +327,12 @@ class CodecTest {
         }
 
         @Test fun `unknown type nibble decodes to null`() {
-            assertNull(decode(byteArrayOf(0x50.toByte()))) // type = 5, reserved
+            assertNull(decode(byteArrayOf(0x60.toByte()))) // type = 6, reserved
         }
 
         @Test fun `all frame types survive distinct type nibbles`() {
             // Ensures no two frame types share the same nibble.
-            val nibbles = listOf(ogm(), data(), beacon(), multicast())
+            val nibbles = listOf(ogm(), data(), beacon(), multicast(), gateway())
                 .map { (encode(it)[0].toInt() and 0xFF) ushr 4 }
             assertEquals(nibbles.distinct().size, nibbles.size)
         }
