@@ -12,6 +12,7 @@ The library runs entirely at the application layer — no kernel modules, no raw
 - **Jitter-based relay suppression** — in a dense subnet of N neighbours, expected relays ≈ ln(N) instead of N−1; per-cycle ±10% interval jitter prevents phase-lock collisions on shared air links
 - **Beacon-driven multicast spanning trees** — members build the tree themselves; no network-wide flooding
 - **Flood broadcast** — delivers a frame to every reachable node without group membership or a spanning tree; uses OGM-style relay suppression; bypasses radio silence by default (distress/SOS use case)
+- **Gateway announcements** — a mesh node can advertise external nodes reachable through it; announcements propagate mesh-wide at a configurable multiple of the OGM interval and slow down automatically when crossing from fast to slow links
 - **Pull-model transmit queue** with rule-based ordering and per-handle cancellation, replacement and reordering
 - **Widest-path bandwidth routing** — OGMs carry the minimum bandwidth tier of every link traversed; the router always prefers the path whose bottleneck link is widest
 - **Compact wire format** — 8 bytes for an OGM, 8 bytes for a beacon, varint-encoded payload length (no upper limit at the codec layer)
@@ -102,7 +103,8 @@ router.start(
     links: List<Link>,
     txQueue: TxQueue = TxQueue(),
     staleThreshold: Duration = 90.seconds,
-    neighborPurgeMultiplier: Int = 3
+    neighborPurgeMultiplier: Int = 3,
+    gatewayIntervalMultiplier: Int = 5
 )
 ```
 
@@ -110,6 +112,7 @@ router.start(
 |---|---|
 | `staleThreshold` | How long a multicast branch is kept without a refreshing beacon before eviction |
 | `neighborPurgeMultiplier` | Route is evicted after this many missed OGM cycles on its link |
+| `gatewayIntervalMultiplier` | Gateway announcements are sent every this many OGM cycles per link |
 
 Call `router.start(scope, selfId, links)` before using any other method. All protocol loops run inside a child scope derived from `scope` — cancelling `scope` also stops the router, but `router.stop()` stops it independently without affecting `scope`. Calling `start` again after `stop` resets all internal state so the node restarts clean.
 
@@ -244,6 +247,46 @@ Flood frames are prioritised in the transmit queue above DATA and MULTICAST but 
 
 ---
 
+## Gateway announcements
+
+A mesh node can advertise that it provides connectivity to nodes that are not part of the mesh — external devices on a wired LAN, another network segment, legacy hardware, or any endpoint reachable only through that node.
+
+```kotlin
+// Advertise that node 100 and node 200 are reachable through this router
+router.addExternalId(100u)
+router.addExternalId(200u)
+
+// Stop advertising node 100
+router.removeExternalId(100u)
+```
+
+The router periodically broadcasts a `GatewayFrame` on each link, listing the registered external IDs. Other nodes receiving the announcement record a **gateway routing entry**: to reach external node X, forward to mesh node G. `send` checks this table automatically as a fallback when the destination is not in the main routing table — no change to call sites required:
+
+```kotlin
+// Works transparently whether dstId is a mesh node or an external node
+router.send(dstId = 100u, payload = bytes)
+```
+
+The live gateway table is exposed as a `StateFlow`:
+
+```kotlin
+// Current snapshot: external NodeId → gateway mesh NodeId
+val table: Map<NodeId, NodeId> = router.gatewayRoutes.value
+
+// Live updates
+router.gatewayRoutes.collect { table -> println(table) }
+```
+
+### Announcement cadence
+
+Gateway frames are sent on each link every `gatewayIntervalMultiplier × link.ogmInterval` (default: 5×). This is intentionally slower than OGMs — external topology changes rarely and the frames carry no routing metric that needs continuous refreshing.
+
+Relay nodes apply the same per-link rate limiting as OGM relays: when a gateway announcement crosses from a fast link to a slow link, the relay rate is capped to the slow link's interval. The `gatewayIntervalSecs` field in the frame carries the longest interval seen along the path, so receiving nodes size their eviction timeout correctly even when the announcement arrived via a slow intermediate hop.
+
+Stale gateway entries are evicted by the same purge loop as routing table entries, using a timeout of `gatewayIntervalMultiplier × neighborPurgeMultiplier × gatewayIntervalSecs`.
+
+---
+
 ## Radio silence
 
 ```kotlin
@@ -342,11 +385,12 @@ All frames are bit-packed big-endian. Byte 0 always carries the 4-bit type tag i
 
 | Frame | Size | Notes |
 |---|---|---|
-| `OgmFrame` | 7 bytes | originatorId(12b) + senderId(12b) + ttl(4b) + seqNum(16b) + minBandwidthTier(8b) |
+| `OgmFrame` | 8 bytes | originatorId(12b) + senderId(12b) + ttl(4b) + seqNum(16b) + minBandwidthTier(8b) + ogmIntervalSecs(8b) |
 | `DataFrame` | 7 + n bytes | nextHop(12b) + src(12b) + dst(12b) + ttl(4b) + varint(len) + payload |
 | `BeaconFrame` | 8 bytes | nextHop(12b) + src(12b) + groupId(20b) + activeRoot(12b) |
 | `MulticastFrame` | 8 + n bytes | src(12b) + groupId(20b) + ttl(4b) + seqNum(16b) + varint(len) + payload |
 | `FloodFrame` | 6 + n bytes | src(12b) + seqNum(16b) + ttl(4b) + varint(len) + payload |
+| `GatewayFrame` | 6 + m bytes | src(12b) + seqNum(16b) + ttl(4b) + count(4b) + intervalSecs(8b) + count × 12-bit IDs packed (pairs → 3 bytes, odd tail → 2 bytes) |
 
 Payload lengths use a 7-bit continuation varint: lengths ≤127 cost 1 byte, ≤16383 cost 2 bytes, ≤2097151 cost 3 bytes. No upper limit is imposed at the codec layer.
 
@@ -367,6 +411,8 @@ Payload lengths use a 7-bit continuation varint: lengths ≤127 cost 1 byte, ≤
 **Why activeRoot carried in BeaconFrame?** Relay nodes need no local configuration. The active root is embedded in every beacon, so any node can forward toward the correct root without knowing the group's root list.
 
 **Why rate-limit OGM relays per outgoing link?** In a heterogeneous mesh a single node may bridge a fast link (e.g. WiFi, 5 s interval) to a slow link (e.g. LoRa, 90 s interval). Without a rate limit, every OGM from a fast-side originator would be relayed onto the slow link at the fast link's cadence — 18 routing frames per 90 s window instead of 1. The relay rate limiter (`lastOgmRelayTime`) caps relays to at most one per `ogmInterval` of the outgoing link, so the slow medium never sees more OGM traffic than it would generate itself. The jitter-based 1/N suppression still fires first and may suppress the relay entirely; the rate limiter is a backstop for the case where suppression does not fire (sparse chains where `hearingCount` is always 1).
+
+**Why are gateway announcements per-link rather than a single global timer?** The same reasoning as OGMs: a LoRa link at 90 s intervals should not receive announcements at the same rate as a WiFi link at 5 s intervals. Each link's `gatewayLoop` fires at `gatewayIntervalMultiplier × link.ogmInterval`, so the announcement cadence scales naturally with the medium. Relay nodes then apply the same per-link rate limiter used for OGMs — when an announcement crosses from a fast link to a slow one, the relay is capped to the slow link's interval rather than forwarding at the fast link's rate.
 
 **Why does flood bypass silent mode by default?** Silent mode is designed to suppress routing participation — the node goes dark to avoid influencing the mesh. But a node that needs to send a distress signal should be able to do so regardless of its current routing posture. Passing `respectSilent = true` opts back into the normal suppression if the application requires it.
 
