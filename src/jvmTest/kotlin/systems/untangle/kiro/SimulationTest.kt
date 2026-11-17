@@ -909,6 +909,167 @@ class SimulationTest {
         coroutineContext.cancelChildren()
     }
 
+    // ─── Scenario G1: unicast to external ID via direct gateway ──────────────
+    //
+    //   A(1) ──m1── G(2)  [G is gateway for external node E=100]
+    //
+    //   G announces E=100. A learns the gateway route and sends to E.
+    //   G receives via incomingGatewayData with the correct srcId and dstId.
+    //
+    //   Assertions
+    //   ─────────────────────────────────────────────────────────────────────
+    //   • A's gatewayRoutes contains E→G after announcement convergence.
+    //   • send(E) from A delivers to G.incomingGatewayData with srcId=A, dstId=E.
+
+    @Test
+    fun `scenario G1 — unicast to external ID reaches incomingGatewayData`() = runBlocking(Dispatchers.Default) {
+        val m1 = SimMedium()
+        val a  = node(1u, simLink("A-1", m1))
+        val g  = node(2u, simLink("G-1", m1))
+
+        a.startIn(this); g.startIn(this)
+        g.addExternalId(100u)
+        delay(OGM_CONV)   // OGM routes + gateway announcement both converge
+
+        assertEquals(g.selfId, a.gatewayRoutes.value[100u.toUShort()],
+            "A should know E=100 is reachable via G")
+
+        val got = subscribeAndTrigger(g.incomingGatewayData, { it.dstId == 100u.toUShort() }) {
+            a.send(100u, "hello E".encodeToByteArray())
+        }
+        val msg = got.awaitOrFail(message = "gateway data A→E")
+        assertEquals(a.selfId, msg.srcId)
+        assertEquals(100u.toUShort(), msg.dstId)
+        assertEquals("hello E", msg.payload.decodeToString())
+
+        coroutineContext.cancelChildren()
+    }
+
+    // ─── Scenario G2: unicast to external ID via 2-hop relay ─────────────────
+    //
+    //   A(1) ──m1── B(2) ──m2── G(3)  [G is gateway for external node E=100]
+    //
+    //   G's gateway announcement propagates through B to A. A sends to E — the
+    //   frame is routed A→B→G and delivered via G.incomingGatewayData.
+    //
+    //   Assertions
+    //   ─────────────────────────────────────────────────────────────────────
+    //   • A's gatewayRoutes contains E→G after relayed announcement convergence.
+    //   • send(E) from A delivers to G.incomingGatewayData with srcId=A, dstId=E.
+
+    @Test
+    fun `scenario G2 — 2-hop relay, gateway announcement propagates, send reaches gateway`() = runBlocking(Dispatchers.Default) {
+        val m1 = SimMedium(); val m2 = SimMedium()
+        val a  = node(1u, simLink("A-1", m1))
+        val b  = node(2u, simLink("B-1", m1), simLink("B-2", m2))
+        val g  = node(3u, simLink("G-2", m2))
+
+        a.startIn(this); b.startIn(this); g.startIn(this)
+        g.addExternalId(100u)
+        delay(OGM_CONV)   // OGM routes + relayed gateway announcement converge
+
+        assertEquals(g.selfId, a.gatewayRoutes.value[100u.toUShort()],
+            "A should know E=100 is reachable via G after relayed announcement")
+
+        val got = subscribeAndTrigger(g.incomingGatewayData, { it.dstId == 100u.toUShort() }) {
+            a.send(100u, "relayed".encodeToByteArray())
+        }
+        val msg = got.awaitOrFail(message = "gateway data A→E via relay B")
+        assertEquals(a.selfId, msg.srcId)
+        assertEquals(100u.toUShort(), msg.dstId)
+        assertEquals("relayed", msg.payload.decodeToString())
+
+        coroutineContext.cancelChildren()
+    }
+
+    // ─── Scenario G3: external root — beacon routing and multicast ────────────
+    //
+    //   M(1) ──m1── R(2) ──m2── G(3)  [G is gateway for external node E=100]
+    //
+    //   M and R both join a multicast group whose root is E=100 (external).
+    //   Beacons from M flow through R toward G; G recognises E as its own
+    //   external ID and stops forwarding, anchoring the spanning tree.
+    //   Relay nodes route beacons toward E using the gateway table.
+    //
+    //   Assertions
+    //   ─────────────────────────────────────────────────────────────────────
+    //   • After tree build: R.sendMulticast reaches M.
+    //   • After tree build: M.sendMulticast reaches R.
+
+    @Test
+    fun `scenario G3 — external root, beacons routed via gateway, multicast delivered`() = runBlocking(Dispatchers.Default) {
+        val m1 = SimMedium(); val m2 = SimMedium()
+        val m  = node(1u, simLink("M-1", m1))
+        val r  = node(2u, simLink("R-1", m1), simLink("R-2", m2))
+        val g  = node(3u, simLink("G-2", m2))
+
+        m.startIn(this); r.startIn(this); g.startIn(this)
+        g.addExternalId(100u)
+        delay(OGM_CONV)   // routes and gateway announcements must converge before joining
+
+        val gid = GroupId(10u)
+        m.joinGroup(gid, roots = listOf(100u))
+        r.joinGroup(gid, roots = listOf(100u))
+        delay(TREE_BUILD)   // beacons M→R→G build the spanning tree
+
+        // ── R sends → M receives ──
+        val gotM = subscribeAndTrigger(m.incomingMulticast, { it.groupId == gid }) {
+            r.sendMulticast(gid, "R→M".encodeToByteArray())
+        }
+        assertEquals("R→M", gotM.awaitOrFail(message = "multicast R→M with external root").payload.decodeToString())
+
+        // ── M sends → R receives ──
+        val gotR = subscribeAndTrigger(r.incomingMulticast, { it.groupId == gid }) {
+            m.sendMulticast(gid, "M→R".encodeToByteArray())
+        }
+        assertEquals("M→R", gotR.awaitOrFail(message = "multicast M→R with external root").payload.decodeToString())
+
+        coroutineContext.cancelChildren()
+    }
+
+    // ─── Scenario G4: dual delivery — external ID overlaps a mesh node ────────
+    //
+    //   A(1) ──m1── G(2)[external X=3] ──m2── X(3)
+    //
+    //   G registers X=3 as an external ID, but X is also a full mesh node.
+    //   When A sends to X=3, the frame passes through G: G emits it to
+    //   incomingGatewayData AND forwards it onward to X in the mesh.
+    //
+    //   Assertions
+    //   ─────────────────────────────────────────────────────────────────────
+    //   • X receives the frame via incomingData (mesh delivery).
+    //   • G also delivers the frame via incomingGatewayData (gateway delivery).
+
+    @Test
+    fun `scenario G4 — dual delivery, external ID overlapping mesh node delivered to both`() = runBlocking(Dispatchers.Default) {
+        val m1 = SimMedium(); val m2 = SimMedium()
+        val a  = node(1u, simLink("A-1", m1))
+        val g  = node(2u, simLink("G-1", m1), simLink("G-2", m2))
+        val x  = node(3u, simLink("X-2", m2))
+
+        a.startIn(this); g.startIn(this); x.startIn(this)
+        g.addExternalId(3u)   // X=3 is both a mesh node and an external ID on G
+        delay(OGM_CONV)
+
+        val gotX = CompletableDeferred<Pair<NodeId, ByteArray>>()
+        val gotG = CompletableDeferred<GatewayDataMessage>()
+        launch { x.incomingData.first().let { gotX.complete(it) } }
+        launch { g.incomingGatewayData.filter { it.dstId == 3u.toUShort() }.first().let { gotG.complete(it) } }
+        delay(SUB_DELAY)
+        a.send(3u, "dual".encodeToByteArray())
+
+        val (srcX, payX) = gotX.awaitOrFail(message = "X should receive via incomingData")
+        assertEquals(a.selfId, srcX)
+        assertEquals("dual", payX.decodeToString())
+
+        val gwMsg = gotG.awaitOrFail(message = "G should receive via incomingGatewayData")
+        assertEquals(a.selfId, gwMsg.srcId)
+        assertEquals(3u.toUShort(), gwMsg.dstId)
+        assertEquals("dual", gwMsg.payload.decodeToString())
+
+        coroutineContext.cancelChildren()
+    }
+
     // ─── Scenario 15: silent node still floods by default ────────────────────
     //
     //   A(1) ──m1── B(2)

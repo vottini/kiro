@@ -360,9 +360,7 @@ class KiroRouter {
      */
     suspend fun send(dstId: NodeId, payload: ByteArray) {
         if (silent) return
-        val routeId = if (neighborTable.containsKey(dstId)) dstId
-                      else gatewayTable[dstId]?.gatewayId ?: return
-        val route = neighborTable[routeId] ?: return
+        val route = resolveRouteId(dstId)?.let { neighborTable[it] } ?: return
         val frame = Frame.DataFrame(
             nextHop = route.nextHop,
             srcId   = selfId,
@@ -608,7 +606,7 @@ class KiroRouter {
                 continue
             }
             val activeRoot = resolveActiveRoot(gid) ?: run { delay(1.seconds); return@run null } ?: continue
-            val route = neighborTable[activeRoot]   ?: run { delay(1.seconds); return@run null } ?: continue
+            val route = resolveRouteId(activeRoot)?.let { neighborTable[it] } ?: run { delay(1.seconds); return@run null } ?: continue
             multicastTree.registerUpstream(gid, route.link)
             if (!silent) txQueue.enqueue(TxEntry(
                 frame         = encode(Frame.BeaconFrame(route.nextHop, selfId, gid, activeRoot)),
@@ -622,12 +620,16 @@ class KiroRouter {
     /**
      * Returns the first reachable root candidate for [gid].
      * Returns `null` if no candidates are registered or none currently has a route
-     * in [neighborTable].
+     * in [neighborTable] or [gatewayTable].
      */
     private fun resolveActiveRoot(gid: GroupId): NodeId? {
         val candidates = groupRoots[gid] ?: return null
-        return candidates.firstOrNull { neighborTable[it] != null }
+        return candidates.firstOrNull { neighborTable[it] != null || gatewayTable[it] != null }
     }
+
+    /** Returns the mesh NodeId to route toward for [id]: itself if a mesh node, the gateway if external. */
+    private fun resolveRouteId(id: NodeId): NodeId? =
+        if (neighborTable.containsKey(id)) id else gatewayTable[id]?.gatewayId
 
     /**
      * Periodically removes unreachable entries from [neighborTable].
@@ -878,11 +880,10 @@ class KiroRouter {
         }
         if (frame.dstId in externalIds) {
             _incomingGatewayData.tryEmit(GatewayDataMessage(frame.srcId, frame.dstId, frame.payload))
-            return
         }
         if (silent) return
         if (frame.ttl == 0u.toUByte()) return
-        val route = neighborTable[frame.dstId] ?: return
+        val route = resolveRouteId(frame.dstId)?.let { neighborTable[it] } ?: return
         txQueue.enqueue(TxEntry(
             frame         = encode(frame.copy(nextHop = route.nextHop, ttl = (frame.ttl - 1u).toUByte())),
             eligibleLinks = setOf(route.link),
@@ -910,10 +911,10 @@ class KiroRouter {
 
         multicastTree.registerDownstream(frame.groupId, incomingLink)
 
-        if (frame.activeRoot == selfId) return
+        if (frame.activeRoot == selfId || frame.activeRoot in externalIds) return
         if (silent) return
 
-        val route = neighborTable[frame.activeRoot] ?: return
+        val route = resolveRouteId(frame.activeRoot)?.let { neighborTable[it] } ?: return
         multicastTree.registerUpstream(frame.groupId, route.link)
         txQueue.enqueue(TxEntry(
             frame         = encode(frame.copy(nextHop = route.nextHop)),
