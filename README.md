@@ -267,6 +267,14 @@ The router periodically broadcasts a `GatewayFrame` on each link, listing the re
 router.send(dstId = 100u, payload = bytes)
 ```
 
+When a frame arrives at the gateway node addressed to one of its registered external IDs, it is delivered via `incomingGatewayData` rather than `incomingData` — the message carries both `srcId` and `dstId` so the application knows which external node to forward it to:
+
+```kotlin
+router.incomingGatewayData.collect { msg ->
+    externalInterface[msg.dstId]?.forward(msg.srcId, msg.payload)
+}
+```
+
 The live gateway table is exposed as a `StateFlow`:
 
 ```kotlin
