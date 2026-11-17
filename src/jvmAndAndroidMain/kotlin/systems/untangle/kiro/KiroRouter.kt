@@ -24,6 +24,12 @@ const val MAX_TTL: UByte = 15u
 private data class GatewayEntry(val gatewayId: NodeId, val lastSeen: Instant, val intervalSecs: Int)
 
 /**
+ * Payload delivered to [KiroRouter.incomingGatewayData] collectors when a [Frame.DataFrame]
+ * arrives addressed to an external node registered via [KiroRouter.addExternalId].
+ */
+data class GatewayDataMessage(val srcId: NodeId, val dstId: NodeId, val payload: ByteArray)
+
+/**
  * Payload delivered to [KiroRouter.incomingMulticast] collectors when a
  * [Frame.MulticastFrame] is received and this node is a member of the target group.
  */
@@ -195,6 +201,15 @@ class KiroRouter {
     private val _incomingFlood = MutableSharedFlow<Pair<NodeId, ByteArray>>(extraBufferCapacity = 64)
     /** Emits (srcId, payload) whenever a [Frame.FloodFrame] reaches this node. */
     val incomingFlood: SharedFlow<Pair<NodeId, ByteArray>> = _incomingFlood
+
+    private val _incomingGatewayData = MutableSharedFlow<GatewayDataMessage>(extraBufferCapacity = 64)
+    /**
+     * Emits a [GatewayDataMessage] whenever a unicast [Frame.DataFrame] arrives addressed to
+     * an external node registered via [addExternalId]. The [GatewayDataMessage.dstId] identifies
+     * which external node the frame was destined for, so the application can dispatch it
+     * to the correct downstream interface.
+     */
+    val incomingGatewayData: SharedFlow<GatewayDataMessage> = _incomingGatewayData
 
     private val _routes = MutableStateFlow<Map<NodeId, NeighborEntry>>(emptyMap())
     /**
@@ -859,6 +874,10 @@ class KiroRouter {
         if (frame.nextHop != selfId) return
         if (frame.dstId == selfId) {
             _incomingData.tryEmit(frame.srcId to frame.payload)
+            return
+        }
+        if (frame.dstId in externalIds) {
+            _incomingGatewayData.tryEmit(GatewayDataMessage(frame.srcId, frame.dstId, frame.payload))
             return
         }
         if (silent) return
