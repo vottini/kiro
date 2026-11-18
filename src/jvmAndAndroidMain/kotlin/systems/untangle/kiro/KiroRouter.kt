@@ -360,6 +360,9 @@ class KiroRouter {
      */
     suspend fun send(dstId: NodeId, payload: ByteArray) {
         if (silent) return
+        if (dstId in externalIds) {
+            _incomingGatewayData.tryEmit(GatewayDataMessage(selfId, dstId, payload))
+        }
         val route = resolveRouteId(dstId)?.let { neighborTable[it] } ?: return
         val frame = Frame.DataFrame(
             nextHop = route.nextHop,
